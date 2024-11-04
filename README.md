@@ -1576,38 +1576,3 @@ Contributions are welcome! If you find any issues or have suggestions for improv
 
 This project is licensed under the [MIT License](LICENSE). You are free to use, modify, and distribute it as per the terms of the license.
 ```
-
----
-
-**Instructions to Save as a `.md` File:**
-
-1. **Copy the Markdown Content:**
-   - Highlight all the text within the code block above (the part between the triple backticks ```markdown and ```).
-   - Right-click and select "Copy" or use `Ctrl+C` (Windows/Linux) or `Cmd+C` (Mac).
-
-2. **Paste into a Text Editor:**
-   - Open your preferred text editor (e.g., Notepad, VS Code, Sublime Text).
-   - Create a new file.
-   - Paste the copied content into the file (`Ctrl+V` or `Cmd+V`).
-
-3. **Save the File:**
-   - Save the file with the name `README.md`.
-   - Ensure the file extension is `.md` to recognize it as a Markdown file.
-
-4. **Convert to PDF (Optional):**
-   - If you wish to convert the Markdown file to PDF, you can use tools like [Pandoc](https://pandoc.org/), [Typora](https://typora.io/), or any Markdown editor that supports PDF export.
-
-**Example Using Pandoc:**
-
-```bash
-pandoc README.md -o README.pdf
-```
-
-**Example Using Typora:**
-
-1. Open `README.md` in Typora.
-2. Go to `File` > `Export` > `PDF`.
-
----
-
-If you continue to experience formatting issues, please let me know the specific problems you're encountering, and I'll assist you further!
