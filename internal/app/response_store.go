@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,79 @@ func (rs *ResponseStore) StoreResponseForUser(content string, userID int) string
 		return ""
 	}
 
+	return id
+}
+
+// LoadResponsesFromS3 loads all existing responses from the S3 bucket into the in-memory store.
+func (rs *ResponseStore) LoadResponsesFromS3() error {
+	rs.mutex.Lock()
+	defer rs.mutex.Unlock()
+
+	prefix := "web_responses/"
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(rs.bucket),
+		Prefix: aws.String(prefix),
+	}
+
+	err := rs.s3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		for _, obj := range page.Contents {
+			// Retrieve each response JSON from S3
+			getInput := &s3.GetObjectInput{
+				Bucket: aws.String(rs.bucket),
+				Key:    obj.Key,
+			}
+			resp, err := rs.s3Client.GetObject(getInput)
+			if err != nil {
+				log.Printf("Failed to get object %s from S3: %v", *obj.Key, err)
+				continue
+			}
+			bodyBytes, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				log.Printf("Failed to read object %s from S3: %v", *obj.Key, err)
+				continue
+			}
+
+			var entry responseEntry
+			if err := json.Unmarshal(bodyBytes, &entry); err != nil {
+				log.Printf("Failed to unmarshal JSON for object %s: %v", *obj.Key, err)
+				continue
+			}
+
+			// Check if the response has already expired
+			if time.Now().After(entry.ExpiresAt) {
+				// Optionally delete expired responses immediately
+				rs.DeleteResponse(getResponseIDFromKey(*obj.Key))
+				continue
+			}
+
+			// Extract the response ID from the object key
+			id := getResponseIDFromKey(*obj.Key)
+
+			// Add to in-memory store
+			rs.responses[id] = entry
+		}
+		return true // Continue to next page
+	})
+
+	if err != nil {
+		log.Printf("Error listing objects in S3: %v", err)
+		return err
+	}
+
+	log.Println("Successfully loaded responses from S3 into memory.")
+	return nil
+}
+
+// getResponseIDFromKey extracts the response ID from the S3 object key.
+func getResponseIDFromKey(key string) string {
+	// Assuming the key format is "web_responses/{id}.json"
+	parts := strings.Split(key, "/")
+	if len(parts) != 2 {
+		return ""
+	}
+	idWithExt := parts[1]
+	id := strings.TrimSuffix(idWithExt, ".json")
 	return id
 }
 
@@ -259,8 +333,11 @@ func (rs *ResponseStore) DeleteResponse(id string) {
 		Bucket: aws.String(rs.bucket),
 		Key:    aws.String(objectKey),
 	})
+
 	if err != nil {
 		log.Printf("Failed to delete response from S3 for ID %s: %v", id, err)
+	} else {
+		log.Printf("Successfully deleted response ID %s from S3.", id)
 	}
 }
 
@@ -282,6 +359,8 @@ func (rs *ResponseStore) cleanupExpiredResponses() {
 				})
 				if err != nil {
 					log.Printf("Failed to delete expired response from S3 for ID %s: %v", id, err)
+				} else {
+					log.Printf("Successfully deleted expired response ID %s from S3.", id)
 				}
 			}
 		}
