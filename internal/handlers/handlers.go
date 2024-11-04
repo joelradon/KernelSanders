@@ -16,4 +16,5 @@ type MessageProcessor interface {
 	StoreUserSourceCode(userID int, code string) error  // Added to store source code
 	ListUserFiles(userID int) ([]types.UserFile, error) // Updated to use types.UserFile
 	GetUserData(userID int) (string, error)             // Added to get user data
+	HandleUpdate(update *types.TelegramUpdate)          // Added to handle incoming updates
 }
