@@ -2,7 +2,9 @@
 
 package handlers
 
-import "KernelSandersBot/internal/types"
+import (
+	"KernelSandersBot/internal/types"
+)
 
 // MessageProcessor defines the methods that the telegram package requires from the app package.
 type MessageProcessor interface {
@@ -10,4 +12,8 @@ type MessageProcessor interface {
 	HandleCommand(message *types.TelegramMessage, userID int, username string) (string, error)
 	SendMessage(chatID int64, text string, replyToMessageID int) error
 	GetBotUsername() string
+	GetTelegramToken() string                           // Added to support file download
+	StoreUserSourceCode(userID int, code string) error  // Added to store source code
+	ListUserFiles(userID int) ([]types.UserFile, error) // Updated to use types.UserFile
+	GetUserData(userID int) (string, error)             // Added to get user data
 }

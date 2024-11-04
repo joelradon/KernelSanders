@@ -2,6 +2,28 @@
 
 package types
 
+import (
+	"time"
+)
+
+// UserFile represents a user's uploaded file with timestamps.
+type UserFile struct {
+	FileName        string
+	UploadedAtUTC   time.Time
+	UploadedAtEDT   time.Time
+	DeletionTimeUTC time.Time
+	DeletionTimeEDT time.Time
+}
+
+// UserResponse represents a user's web response with timestamps.
+type UserResponse struct {
+	ID              string
+	CreatedAtUTC    time.Time
+	CreatedAtEDT    time.Time
+	DeletionTimeUTC time.Time
+	DeletionTimeEDT time.Time
+}
+
 // TelegramUpdate represents an incoming update from Telegram.
 type TelegramUpdate struct {
 	UpdateID      int              `json:"update_id"`
@@ -12,13 +34,22 @@ type TelegramUpdate struct {
 
 // TelegramMessage represents a message in Telegram.
 type TelegramMessage struct {
-	MessageID      int              `json:"message_id"`
-	From           TelegramUser     `json:"from"`
-	Chat           TelegramChat     `json:"chat"`
-	Date           int              `json:"date"`
-	Text           string           `json:"text"`
-	Entities       []TelegramEntity `json:"entities,omitempty"`
-	ReplyToMessage *TelegramMessage `json:"reply_to_message,omitempty"`
+	MessageID      int               `json:"message_id"`
+	From           TelegramUser      `json:"from"`
+	Chat           TelegramChat      `json:"chat"`
+	Date           int               `json:"date"`
+	Text           string            `json:"text,omitempty"`
+	Entities       []TelegramEntity  `json:"entities,omitempty"`
+	ReplyToMessage *TelegramMessage  `json:"reply_to_message,omitempty"`
+	Document       *TelegramDocument `json:"document,omitempty"` // Added to handle file uploads
+}
+
+// TelegramDocument represents a document (file) in Telegram.
+type TelegramDocument struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name"`
+	FileSize int    `json:"file_size"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 // TelegramUser represents a user in Telegram.
@@ -84,3 +115,19 @@ type OpenAIUsage struct {
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
 }
+
+// TelegramFileResponse represents the response from Telegram's getFile API.
+type TelegramFileResponse struct {
+	OK     bool             `json:"ok"`
+	Result TelegramFileInfo `json:"result"`
+}
+
+// TelegramFileInfo contains information about the file from Telegram's getFile API.
+type TelegramFileInfo struct {
+	FileID   string `json:"file_id"`
+	FileSize int    `json:"file_size"`
+	FilePath string `json:"file_path"`
+}
+
+// Constants
+const FileRetentionTime = 4 * time.Hour

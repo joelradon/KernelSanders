@@ -12,6 +12,9 @@ import (
 type S3ClientInterface interface {
 	GetObject(input *s3.GetObjectInput) (*s3.GetObjectOutput, error)
 	PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error)
+	ListObjectsV2Pages(input *s3.ListObjectsV2Input, fn func(*s3.ListObjectsV2Output, bool) bool) error
+	DeleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error)
+	HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error)
 }
 
 // S3Client is an implementation of S3ClientInterface for AWS S3
@@ -38,4 +41,19 @@ func (c *S3Client) GetObject(input *s3.GetObjectInput) (*s3.GetObjectOutput, err
 // PutObject uploads an object to the specified S3 bucket
 func (c *S3Client) PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
 	return c.s3Svc.PutObject(input)
+}
+
+// ListObjectsV2Pages lists objects in the specified S3 bucket using pagination
+func (c *S3Client) ListObjectsV2Pages(input *s3.ListObjectsV2Input, fn func(*s3.ListObjectsV2Output, bool) bool) error {
+	return c.s3Svc.ListObjectsV2Pages(input, fn)
+}
+
+// DeleteObject deletes an object from the specified S3 bucket
+func (c *S3Client) DeleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	return c.s3Svc.DeleteObject(input)
+}
+
+// HeadObject retrieves metadata about an object in the S3 bucket
+func (c *S3Client) HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	return c.s3Svc.HeadObject(input)
 }
