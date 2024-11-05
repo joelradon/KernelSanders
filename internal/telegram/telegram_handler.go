@@ -200,8 +200,8 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 		log.Printf("Failed to send confirmation message: %v", err)
 	}
 
-	// Task 3: Send analysis summary
-	summary, err := th.AnalyzeUserCode(message.From.ID)
+	// Send analysis summary using the Processor's AnalyzeUserCode method
+	summary, err := th.Processor.AnalyzeUserCode(message.From.ID)
 	if err != nil {
 		log.Printf("Failed to analyze user code: %v", err)
 		// Optionally notify the user about the failure
@@ -217,26 +217,6 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 	}
 
 	return "", nil
-}
-
-// AnalyzeUserCode generates a brief summary of the user's uploaded code.
-func (th *TelegramHandler) AnalyzeUserCode(userID int) (string, error) {
-	// Retrieve the user's source code using the GetUserSourceCode method
-	code, exists := th.Processor.GetUserSourceCode(userID)
-	if !exists {
-		return "", errors.New("no source code found for user")
-	}
-
-	// Create a prompt for summarization
-	prompt := fmt.Sprintf("Summarize the following source code in up to 10 words:\n\n%s", code)
-
-	// Send the prompt to the bot to get a summary
-	summary, err := th.Processor.GetSummary(prompt)
-	if err != nil {
-		return "", err
-	}
-
-	return summary, nil
 }
 
 // getFileURL retrieves the download URL for the given file ID using Telegram's getFile API.
