@@ -91,7 +91,7 @@ func (th *TelegramHandler) HandleTelegramMessage(update *types.TelegramUpdate) (
 
 	// Implement Task 1: Remove "/upload" from group chats and inform users to message directly
 	if isGroup && strings.HasPrefix(message.Text, "/upload@"+th.Processor.GetBotUsername()) {
-		errMsg := "🔒 *Privacy Notice*\n\nFor privacy reasons, please message me directly by clicking @" + th.Processor.GetBotUsername() + " to upload your source code files."
+		errMsg := "✅ *Privacy Notice*\n\nFor privacy reasons, please message me directly by clicking @" + th.Processor.GetBotUsername() + " to upload your source code files."
 		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
 			log.Printf("Failed to send privacy notice message: %v", err)
 		}
@@ -137,10 +137,16 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 
 	// In group chats, ensure caption contains @BOT_USERNAME
 	if isGroup && message.Text != "" && !strings.Contains(strings.ToLower(message.Text), "@"+strings.ToLower(th.Processor.GetBotUsername())) {
-		errMsg := fmt.Sprintf("🔒 *Upload Tag Missing*\n\nPlease tag me using @%s in the caption to upload files in group chats.", th.Processor.GetBotUsername())
+		errMsg := fmt.Sprintf("❌ *Upload Tag Missing*\n\nPlease tag me using @%s in the caption to upload files in group chats.", th.Processor.GetBotUsername())
 		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
 			log.Printf("Failed to send upload tag missing message: %v", err)
 		}
+		return "", nil
+	}
+
+	// If in group and tagged, proceed; otherwise, in private chat, proceed
+	if isGroup && !strings.Contains(strings.ToLower(message.Text), "@"+strings.ToLower(th.Processor.GetBotUsername())) {
+		// Should not reach here due to earlier checks
 		return "", nil
 	}
 
@@ -194,7 +200,43 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 		log.Printf("Failed to send confirmation message: %v", err)
 	}
 
+	// Task 3: Send analysis summary
+	summary, err := th.AnalyzeUserCode(message.From.ID)
+	if err != nil {
+		log.Printf("Failed to analyze user code: %v", err)
+		// Optionally notify the user about the failure
+		return "", nil
+	}
+
+	analysisMsg := fmt.Sprintf(
+		"📄 *Code Analysis Summary:*\n\n%s\n\nYou can reference your source code using `#source_code` in your questions.",
+		summary,
+	)
+	if err := th.Processor.SendMessage(message.Chat.ID, analysisMsg, message.MessageID); err != nil {
+		log.Printf("Failed to send code analysis summary message: %v", err)
+	}
+
 	return "", nil
+}
+
+// AnalyzeUserCode generates a brief summary of the user's uploaded code.
+func (th *TelegramHandler) AnalyzeUserCode(userID int) (string, error) {
+	// Retrieve the user's source code using the GetUserSourceCode method
+	code, exists := th.Processor.GetUserSourceCode(userID)
+	if !exists {
+		return "", errors.New("no source code found for user")
+	}
+
+	// Create a prompt for summarization
+	prompt := fmt.Sprintf("Summarize the following source code in up to 10 words:\n\n%s", code)
+
+	// Send the prompt to the bot to get a summary
+	summary, err := th.Processor.GetSummary(prompt)
+	if err != nil {
+		return "", err
+	}
+
+	return summary, nil
 }
 
 // getFileURL retrieves the download URL for the given file ID using Telegram's getFile API.

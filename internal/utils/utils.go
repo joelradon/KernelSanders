@@ -8,11 +8,12 @@ import (
 )
 
 // SummarizeToLength trims the text to the specified maximum length.
+// If the text exceeds the maxLength, it truncates and appends '...'.
 func SummarizeToLength(text string, maxLength int) string {
 	if len(text) <= maxLength {
 		return text
 	}
-	return text[:maxLength]
+	return text[:maxLength] + "..."
 }
 
 // ExtractKeywords extracts keywords from the given text by removing common stopwords.
