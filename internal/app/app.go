@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors" // Added for error handling
 	"fmt"
 	"html"
 	"io"
@@ -31,7 +32,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/joho/godotenv"
-	"github.com/russross/blackfriday/v2" // Added for Markdown parsing
+	"github.com/russross/blackfriday/v2"
 	"golang.org/x/time/rate"
 )
 
@@ -56,7 +57,7 @@ type App struct {
 	TelegramHandler      *telegram.TelegramHandler
 	logMutex             sync.Mutex
 	ResponseStore        *ResponseStore
-	ShutdownChan         chan struct{} // Channel to signal shutdown
+	ShutdownChan         chan struct{}
 	wg                   sync.WaitGroup
 }
 
@@ -77,7 +78,7 @@ func NewApp() *App {
 
 	// Initialize APIHandler for OpenAI
 	apiHandler := api.NewAPIHandler(os.Getenv("OPENAI_KEY"), os.Getenv("OPENAI_ENDPOINT"))
-	log.Printf("OpenAI API Endpoint URL: %s", apiHandler.EndpointURL) // Confirm the endpoint
+	log.Printf("OpenAI API Endpoint URL: %s", apiHandler.EndpointURL)
 
 	// Initialize ResponseStore with S3Client for persistent storage
 	responseStore := NewResponseStore(s3Client, os.Getenv("BUCKET_NAME"))
@@ -172,7 +173,7 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 	deletionTimeEDT := expiresAt.In(time.FixedZone("EDT", -4*3600)).Format(time.RFC1123)
 
 	// Enhance HTML formatting for better readability and add toggle buttons
-	// Removed "Toggle Theme" button and renamed "Toggle Raw" to "View RAW" with explanation
+	// Added "Copy to Clipboard" button
 	formattedText := fmt.Sprintf(
 		`<!DOCTYPE html>
 <html lang="en">
@@ -211,7 +212,7 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 			font-style: italic;
 			color: #a0a0a0;
 		}
-		.view-raw-button {
+		.view-raw-button, .copy-clipboard-button {
 			margin-top: 10px;
 			padding: 5px 10px;
 			background-color: #bb86fc;
@@ -219,6 +220,7 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 			border: none;
 			border-radius: 3px;
 			cursor: pointer;
+			margin-right: 10px;
 		}
 	</style>
 	<script>
@@ -230,6 +232,15 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 				rawContent.style.display = "none";
 			}
 		}
+
+		function copyToClipboard() {
+			var rawContent = document.getElementById("raw-content").innerText;
+			navigator.clipboard.writeText(rawContent).then(function() {
+				alert("RAW code copied to clipboard!");
+			}, function(err) {
+				alert("Failed to copy: ", err);
+			});
+		}
 	</script>
 </head>
 <body>
@@ -239,6 +250,7 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 		<p><strong>Deletion Time:</strong> UTC: %s | EDT: %s</p>
 		<p><strong>Time Remaining:</strong> %s</p>
 		<button class="view-raw-button" onclick="toggleRaw()">View RAW</button>
+		<button class="copy-clipboard-button" onclick="copyToClipboard()">Copy to Clipboard</button>
 		<hr>
 		<div id="formatted-content">%s</div>
 		<div id="raw-content" style="display:none;">
@@ -269,10 +281,8 @@ func (a *App) ProcessMessage(chatID int64, userID int, username, userQuestion st
 		minutes := int(timeRemaining.Minutes())
 		seconds := int(timeRemaining.Seconds()) % 60
 
-		limitMsg := fmt.Sprintf(
-			"🚫 *Rate Limit Exceeded*\n\nYou have reached the maximum number of messages allowed within the last 10 minutes. Please try again in %d minutes and %d seconds.",
-			minutes, seconds,
-		)
+		limitMsg := "✅ *Rate Limit Exceeded*\n\nYou have reached the maximum number of messages allowed within the last 10 minutes. Please try again in " +
+			fmt.Sprintf("%d minutes and %d seconds.", minutes, seconds)
 		if err := a.SendMessage(chatID, limitMsg, messageID); err != nil {
 			log.Printf("Failed to send rate limit message to Telegram: %v", err)
 		}
@@ -284,11 +294,20 @@ func (a *App) ProcessMessage(chatID int64, userID int, username, userQuestion st
 
 	a.UsageCache.AddUsage(userID)
 
-	// Retrieve user's source code if available
-	sourceCode, hasSource := a.GetUserSourceCode(userID)
-	if hasSource {
-		// Prepend source code to the conversation context for context-aware responses
-		userQuestion = fmt.Sprintf("Here is my source code:\n%s\n\n%s", sourceCode, userQuestion)
+	// Detect and replace '#source_code' reference with actual source code
+	if strings.Contains(strings.ToLower(userQuestion), "#source_code") {
+		sourceCode, hasSource := a.GetUserSourceCode(userID)
+		if hasSource {
+			// Replace '#source_code' with the actual source code
+			userQuestion = strings.ReplaceAll(strings.ToLower(userQuestion), "#source_code", sourceCode)
+		} else {
+			// Inform the user that no source code is available
+			errMsg := "❗ *No Source Code Found*\n\nYou have not uploaded any source code yet. Please upload a `.txt` file using the /upload command."
+			if err := a.SendMessage(chatID, errMsg, messageID); err != nil {
+				log.Printf("Failed to send no source code message: %v", err)
+			}
+			return nil
+		}
 	}
 
 	// Maintain conversation context
@@ -436,7 +455,6 @@ func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username
 		command := "/mydata"
 		return a.HandleSpecificCommand(command, message, userID, username)
 	case strings.HasPrefix(message.Text, "/upload@"+a.BotUsername):
-		// Removed "/upload" from group chats as per Task 1
 		// Any attempt to use "/upload@BOT_USERNAME" in group chats will be handled in telegram_handler.go
 		command := "/upload"
 		return a.HandleSpecificCommand(command, message, userID, username)
@@ -449,20 +467,24 @@ func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username
 	case strings.HasPrefix(message.Text, "/my_source_code@"+a.BotUsername):
 		command := "/my_source_code"
 		return a.HandleSpecificCommand(command, message, userID, username)
+	case strings.HasPrefix(message.Text, "/delete_my_data@"+a.BotUsername):
+		command := "/delete_my_data"
+		return a.HandleSpecificCommand(command, message, userID, username)
 	default:
 		switch message.Text {
 		case "/start":
-			welcomeMsg := "🎉 *Welcome to Kernel Sanders Bot!*\n\nYou can ask me questions about your application or upload your source code files for more context."
+			welcomeMsg := "✅ *Welcome to Kernel Sanders Bot!*\n\nYou can ask me questions about your application or upload your source code files for more context."
 			err := a.SendMessage(message.Chat.ID, welcomeMsg, message.MessageID)
 			return "", err
 		case "/help":
 			helpMsg := fmt.Sprintf(
-				"📚 *Help Menu:*\n\n"+
+				"✅ *Help Menu:*\n\n"+
 					"*Commands:*\n"+
 					"/start - Start interacting with the bot\n"+
 					"/help - Show this help message\n"+
 					"/upload - Upload your source code file (only .txt files are supported)\n"+
 					"/mydata - View your uploaded files and web responses\n"+
+					"/delete_my_data - Delete all your uploaded data and web responses\n"+
 					"/security - Learn about the bot's security measures\n"+
 					"/project - Learn about the KernelSanders project and how to contribute\n"+
 					"/my_source_code - Get scripts to prepare your source code for upload\n\n"+
@@ -471,21 +493,21 @@ func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username
 					"These files will be stored for *4 hours* only. Uploading a new file will overwrite the existing one and reset the storage time.\n\n"+
 					"*Short-Lived Web Responses:*\n"+
 					"The bot provides short-lived web response links for easier reading and navigation of your code outputs. Please save any outputs or files you wish to use for long-term purposes, as the web responses will expire after the specified duration.\n\n"+
-					"🔒 *Security:* Only .txt files are accepted to prevent potential security risks associated with other file types.",
+					"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
 				a.BotUsername,
 			)
 			err := a.SendMessage(message.Chat.ID, helpMsg, message.MessageID)
 			return "", err
 		case "/upload":
-			// Removed "/upload" command from group chats as per Task 1
-			uploadMsg := "📤 *Upload Command Removed in Group Chats*\n\nFor privacy reasons, please message me directly by clicking @" + a.BotUsername + " to upload your source code files."
+			// This message will be handled in telegram_handler.go
+			uploadMsg := "✅ *Upload Command Removed in Group Chats*\n\nFor privacy reasons, please message me directly by clicking @" + a.BotUsername + " to upload your source code files."
 			err := a.SendMessage(message.Chat.ID, uploadMsg, message.MessageID)
 			return "", err
 		case "/mydata":
 			myData, err := a.GetUserData(userID)
 			if err != nil {
 				log.Printf("Failed to retrieve user data: %v", err)
-				errorMsg := "❌ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
+				errorMsg := "✅ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
 				a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
 				return "", err
 			}
@@ -493,26 +515,46 @@ func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username
 			return "", err
 		case "/security":
 			securityMsg := fmt.Sprintf(
-				"🔐 *Security Information:*\n\n" +
+				"🔒 *Security Information:*\n\n" +
 					"Your data and responses are handled with the utmost security. Uploaded files are stored securely in S3 with strict access controls and are automatically deleted after 4 hours. All interactions are logged for auditing purposes.\n\n" +
 					"The project's source code is open-source, allowing for community review and contributions. You can view the code on GitHub here: [KernelSanders GitHub](https://github.com/joelradon/KernelSanders).\n\n" +
-					"Feel free to review the code and contribute to its development!",
+					"Feel free to review the code and contribute to its development!\n\n" +
+					"✅ *Delete Your Data:* Use /delete_my_data to remove all your uploaded files and web responses.",
 			)
 			err := a.SendMessage(message.Chat.ID, securityMsg, message.MessageID)
 			return "", err
 		case "/project":
-			projectMsg := "🚀 *KernelSanders Project:*\n\n" +
+			projectMsg := "🌟 *KernelSanders Project:*\n\n" +
 				"The KernelSanders bot is an open-source project designed to assist you with your coding needs. Contributions are welcome! You can view the source code and contribute on GitHub: <a href=\"https://github.com/joelradon/KernelSanders\">KernelSanders GitHub</a>.\n\n" +
-				"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕😊"
+				"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕"
 			err := a.SendMessage(message.Chat.ID, projectMsg, message.MessageID)
 			return "", err
 		case "/my_source_code":
-			mySourceCodeMsg := "💻 *Prepare Your Source Code for Upload:*\n\n" +
-				"Use the following scripts to quickly copy and prepare your source code in a directory tree for upload. These scripts exclude README files and only process specified file types.\n\n" +
-				"*PowerShell Script:* <a href=\"https://s3.amazonaws.com/your-bucket/powershell_prepare_source.ps1\">Download PowerShell Script</a>\n\n" +
-				"*Bash Script:* <a href=\"https://s3.amazonaws.com/your-bucket/bash_prepare_source.sh\">Download Bash Script</a>\n\n" +
-				"These scripts will generate a structured output of your code files, making it easier to upload and manage your projects."
+			mySourceCodeMsg := fmt.Sprintf(
+				"# Overview\n\n"+
+					"These scripts facilitate the preparation and management of source code files, allowing users to easily gather and format their code for AI interactions with KernelSanders. By excluding certain files and ensuring only relevant file types are processed, they optimize the user’s experience when interacting with the AI bot.\n\n"+
+					"Both scripts are designed to:\n"+
+					"- List all files in the current directory and its subdirectories.\n"+
+					"- Print the contents of each file, excluding README.md.\n"+
+					"- Copy the output to the clipboard for easy pasting.\n\n"+
+					"Create a source code text file and upload it to Telegram. It will be stored for 4 hours and linked directly to your username. After that, it will be deleted.\n\n"+
+					"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.bash\n"+
+					"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.ps1\n\n"+
+					"**REMEMBER TO NEVER PUT SENSITIVE CODE ANYWHERE.** While this bot has a private store for each user and deletes each file after 4 hours, practice safe coding and don't put any sensitive information in your code base.\n\n"+
+					"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
+				a.BotUsername,
+			)
 			err := a.SendMessage(message.Chat.ID, mySourceCodeMsg, message.MessageID)
+			return "", err
+		case "/delete_my_data":
+			deleteMsg, err := a.DeleteUserData(userID)
+			if err != nil {
+				log.Printf("Failed to delete user data: %v", err)
+				errorMsg := "✅ *Error Deleting Data*\n\nUnable to delete your data at this time. Please try again later."
+				a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
+				return "", err
+			}
+			err = a.SendMessage(message.Chat.ID, deleteMsg, message.MessageID)
 			return "", err
 		default:
 			unknownCmd := "❓ *Unknown command.* Type /help to see available commands."
@@ -529,7 +571,7 @@ func (a *App) HandleSpecificCommand(command string, message *types.TelegramMessa
 		myData, err := a.GetUserData(userID)
 		if err != nil {
 			log.Printf("Failed to retrieve user data: %v", err)
-			errorMsg := "❌ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
+			errorMsg := "✅ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
 			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
 			return "", err
 		}
@@ -537,26 +579,46 @@ func (a *App) HandleSpecificCommand(command string, message *types.TelegramMessa
 		return "", err
 	case "/security":
 		securityMsg := fmt.Sprintf(
-			"🔐 *Security Information:*\n\n" +
+			"🔒 *Security Information:*\n\n" +
 				"Your data and responses are handled with the utmost security. Uploaded files are stored securely in S3 with strict access controls and are automatically deleted after 4 hours. All interactions are logged for auditing purposes.\n\n" +
 				"The project's source code is open-source, allowing for community review and contributions. You can view the code on GitHub here: [KernelSanders GitHub](https://github.com/joelradon/KernelSanders).\n\n" +
-				"Feel free to review the code and contribute to its development!",
+				"Feel free to review the code and contribute to its development!\n\n" +
+				"✅ *Delete Your Data:* Use /delete_my_data to remove all your uploaded files and web responses.",
 		)
 		err := a.SendMessage(message.Chat.ID, securityMsg, message.MessageID)
 		return "", err
 	case "/project":
-		projectMsg := "🚀 *KernelSanders Project:*\n\n" +
+		projectMsg := "🌟 *KernelSanders Project:*\n\n" +
 			"The KernelSanders bot is an open-source project designed to assist you with your coding needs. Contributions are welcome! You can view the source code and contribute on GitHub: <a href=\"https://github.com/joelradon/KernelSanders\">KernelSanders GitHub</a>.\n\n" +
-			"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕😊"
+			"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕"
 		err := a.SendMessage(message.Chat.ID, projectMsg, message.MessageID)
 		return "", err
 	case "/my_source_code":
-		mySourceCodeMsg := "💻 *Prepare Your Source Code for Upload:*\n\n" +
-			"Use the following scripts to quickly copy and prepare your source code in a directory tree for upload. These scripts exclude README files and only process specified file types.\n\n" +
-			"*PowerShell Script:* <a href=\"https://s3.amazonaws.com/your-bucket/powershell_prepare_source.ps1\">Download PowerShell Script</a>\n\n" +
-			"*Bash Script:* <a href=\"https://s3.amazonaws.com/your-bucket/bash_prepare_source.sh\">Download Bash Script</a>\n\n" +
-			"These scripts will generate a structured output of your code files, making it easier to upload and manage your projects."
+		mySourceCodeMsg := fmt.Sprintf(
+			"# Overview\n\n"+
+				"These scripts facilitate the preparation and management of source code files, allowing users to easily gather and format their code for AI interactions with KernelSanders. By excluding certain files and ensuring only relevant file types are processed, they optimize the user’s experience when interacting with the AI bot.\n\n"+
+				"Both scripts are designed to:\n"+
+				"- List all files in the current directory and its subdirectories.\n"+
+				"- Print the contents of each file, excluding README.md.\n"+
+				"- Copy the output to the clipboard for easy pasting.\n\n"+
+				"Create a source code text file and upload it to Telegram. It will be stored for 4 hours and linked directly to your username. After that, it will be deleted.\n\n"+
+				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.bash\n"+
+				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.ps1\n\n"+
+				"**REMEMBER TO NEVER PUT SENSITIVE CODE ANYWHERE.** While this bot has a private store for each user and deletes each file after 4 hours, practice safe coding and don't put any sensitive information in your code base.\n\n"+
+				"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
+			a.BotUsername,
+		)
 		err := a.SendMessage(message.Chat.ID, mySourceCodeMsg, message.MessageID)
+		return "", err
+	case "/delete_my_data":
+		deleteMsg, err := a.DeleteUserData(userID)
+		if err != nil {
+			log.Printf("Failed to delete user data: %v", err)
+			errorMsg := "✅ *Error Deleting Data*\n\nUnable to delete your data at this time. Please try again later."
+			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
+			return "", err
+		}
+		err = a.SendMessage(message.Chat.ID, deleteMsg, message.MessageID)
 		return "", err
 	default:
 		unknownCmd := "❓ *Unknown command.* Type /help to see available commands."
@@ -581,22 +643,13 @@ func (a *App) GetUserData(userID int) (string, error) {
 
 	// Build the response message
 	var sb strings.Builder
-	sb.WriteString("📊 *Your Data:*\n\n")
+	sb.WriteString("✅ *Your Data:*\n\n")
 
 	if len(files) > 0 {
 		sb.WriteString("*Uploaded Files:*\n")
-		sb.WriteString("| File Name | Uploaded At (UTC) | Uploaded At (EDT) | Deletion Time (UTC) | Deletion Time (EDT) |\n")
-		sb.WriteString("|-----------|-------------------|-------------------|---------------------|---------------------|\n")
 		for _, file := range files {
 			fileURL := a.GenerateFileURL(file.FileName)
-			sb.WriteString(fmt.Sprintf("| <a href=\"%s\">%s</a> | %s | %s | %s | %s |\n",
-				fileURL,
-				file.FileName,
-				file.UploadedAtUTC.Format(time.RFC1123),
-				file.UploadedAtEDT.Format(time.RFC1123),
-				file.DeletionTimeUTC.Format(time.RFC1123),
-				file.DeletionTimeEDT.Format(time.RFC1123),
-			))
+			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">%s</a>\n", fileURL, file.FileName))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -605,18 +658,9 @@ func (a *App) GetUserData(userID int) (string, error) {
 
 	if len(responses) > 0 {
 		sb.WriteString("*Web Responses:*\n")
-		sb.WriteString("| Response ID | Created At (UTC) | Created At (EDT) | Deletion Time (UTC) | Deletion Time (EDT) |\n")
-		sb.WriteString("|-------------|-------------------|-------------------|---------------------|---------------------|\n")
 		for _, resp := range responses {
 			responseURL := a.GenerateResponseURL(resp.ID)
-			sb.WriteString(fmt.Sprintf("| <a href=\"%s\">%s</a> | %s | %s | %s | %s |\n",
-				responseURL,
-				resp.ID,
-				resp.CreatedAtUTC.Format(time.RFC1123),
-				resp.CreatedAtEDT.Format(time.RFC1123),
-				resp.DeletionTimeUTC.Format(time.RFC1123),
-				resp.DeletionTimeEDT.Format(time.RFC1123),
-			))
+			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">Response ID: %s</a>\n", responseURL, resp.ID))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -824,4 +868,71 @@ func (a *App) GetUserSourceCode(userID int) (string, bool) {
 	}
 
 	return string(bodyBytes), true
+}
+
+// DeleteUserData deletes all uploaded source code files and web responses for a user.
+func (a *App) DeleteUserData(userID int) (string, error) {
+	// Delete source code files
+	objectKey := fmt.Sprintf("user_source_code/%d/source_code.txt", userID)
+	_, err := a.S3Client.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(a.S3BucketName),
+		Key:    aws.String(objectKey),
+	})
+	if err != nil {
+		log.Printf("Failed to delete source code from S3 for user %d: %v", userID, err)
+		return "", err
+	}
+
+	// Delete all web responses associated with the user
+	responses, err := a.ResponseStore.GetUserResponsesByUserID(userID)
+	if err != nil {
+		log.Printf("Failed to retrieve user responses for deletion: %v", err)
+		return "", err
+	}
+
+	for _, resp := range responses {
+		a.ResponseStore.DeleteResponse(resp.ID)
+	}
+
+	deleteMsg := "✅ *Data Deleted Successfully*\n\nAll your uploaded files and web responses have been deleted."
+	return deleteMsg, nil
+}
+
+// GetSummary generates a brief summary using the OpenAI API.
+func (a *App) GetSummary(prompt string) (string, error) {
+	// Prepare the messages for OpenAI
+	messages := []types.OpenAIMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	// Query OpenAI for summary
+	summary, err := a.APIHandler.QueryOpenAIWithMessages(messages)
+	if err != nil {
+		log.Printf("Failed to get summary from OpenAI: %v", err)
+		return "", err
+	}
+
+	// Trim any extra whitespace from the summary
+	summary = strings.TrimSpace(summary)
+	return summary, nil
+}
+
+// AnalyzeUserCode generates a brief summary of the user's uploaded code.
+func (a *App) AnalyzeUserCode(userID int) (string, error) {
+	// Retrieve the user's source code
+	code, exists := a.GetUserSourceCode(userID)
+	if !exists {
+		return "", errors.New("no source code found for user")
+	}
+
+	// Create a prompt for summarization
+	prompt := fmt.Sprintf("Provide a concise two-sentence summary of the following source code:\n\n%s", code)
+
+	// Get the summary using the GetSummary method
+	summary, err := a.GetSummary(prompt)
+	if err != nil {
+		return "", err
+	}
+
+	return summary, nil
 }

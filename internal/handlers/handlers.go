@@ -17,4 +17,7 @@ type MessageProcessor interface {
 	ListUserFiles(userID int) ([]types.UserFile, error) // Updated to use types.UserFile
 	GetUserData(userID int) (string, error)             // Added to get user data
 	HandleUpdate(update *types.TelegramUpdate)          // Added to handle incoming updates
+	GetUserSourceCode(userID int) (string, bool)        // Added to retrieve user source code
+	GetSummary(prompt string) (string, error)           // Added to generate summary of user source code
+	AnalyzeUserCode(userID int) (string, error)         // **Added AnalyzeUserCode method**
 }
