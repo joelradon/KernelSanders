@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for kernelsanders on 2024-11-03T21:31:48-05:00
+# fly.toml app configuration file generated for kernelsanders on 2024-11-06T15:15:22-05:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -7,11 +7,6 @@ app = 'kernelsanders'
 primary_region = 'mia'
 
 [build]
-  [build.args]
-    GO_VERSION = '1.16'
-
-[env]
-  PORT = '8080'
 
 [http_service]
   internal_port = 8080
