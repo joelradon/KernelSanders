@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// UserFile represents a user's uploaded file with timestamps.
+// UserFile represents a user's uploaded file or shared repository with timestamps.
 type UserFile struct {
 	FileName        string
 	UploadedAtUTC   time.Time
@@ -127,6 +127,12 @@ type TelegramFileInfo struct {
 	FileID   string `json:"file_id"`
 	FileSize int    `json:"file_size"`
 	FilePath string `json:"file_path"`
+}
+
+// TelegramUpdatesResponse represents the response from Telegram's getUpdates API.
+type TelegramUpdatesResponse struct {
+	OK     bool             `json:"ok"`
+	Result []TelegramUpdate `json:"result"`
 }
 
 // Constants

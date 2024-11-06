@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"KernelSandersBot/internal/handlers"
@@ -19,12 +20,17 @@ import (
 // TelegramHandler handles Telegram updates and delegates processing to the MessageProcessor.
 type TelegramHandler struct {
 	Processor handlers.MessageProcessor
+	client    *http.Client
+	offset    int
+	mutex     sync.Mutex
 }
 
 // NewTelegramHandler initializes a new TelegramHandler.
 func NewTelegramHandler(processor handlers.MessageProcessor) *TelegramHandler {
 	return &TelegramHandler{
 		Processor: processor,
+		client:    &http.Client{Timeout: 60 * time.Second}, // Timeout set to 60 seconds for long polling
+		offset:    0,
 	}
 }
 
@@ -59,24 +65,22 @@ func (th *TelegramHandler) HandleTelegramMessage(update *types.TelegramUpdate) (
 	userID := message.From.ID
 	username := message.From.Username
 
-	if strings.HasPrefix(message.Text, "/") {
-		_, err := th.Processor.HandleCommand(message, userID, username)
-		if err != nil {
-			log.Printf("Error handling command: %v", err)
-			return "", nil
-		}
-		return "", nil
-	}
+	// Determine chat type
+	chatType := message.Chat.Type
+	isGroup := chatType == "group" || chatType == "supergroup"
 
 	isTagged := false
-	if len(message.Entities) > 0 {
+	botUsername := th.Processor.GetBotUsername()
+
+	// Check for explicit tagging in the message
+	if isGroup && len(message.Entities) > 0 {
 		for _, entity := range message.Entities {
 			if entity.Type == "mention" {
 				if entity.Offset+entity.Length > len(message.Text) {
 					continue
 				}
 				mention := message.Text[entity.Offset : entity.Offset+entity.Length]
-				if isTaggedMention(mention, th.Processor.GetBotUsername()) {
+				if isTaggedMention(mention, botUsername) {
 					isTagged = true
 					userQuestion = removeMention(userQuestion, mention)
 					break
@@ -85,22 +89,24 @@ func (th *TelegramHandler) HandleTelegramMessage(update *types.TelegramUpdate) (
 		}
 	}
 
-	// Determine chat type
-	chatType := message.Chat.Type
-	isGroup := chatType == "group" || chatType == "supergroup"
-
-	// Implement Task 1: Remove "/upload" from group chats and inform users to message directly
-	if isGroup && strings.HasPrefix(message.Text, "/upload@"+th.Processor.GetBotUsername()) {
-		errMsg := "✅ *Privacy Notice*\n\nFor privacy reasons, please message me directly by clicking @" + th.Processor.GetBotUsername() + " to upload your source code files."
-		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
-			log.Printf("Failed to send privacy notice message: %v", err)
-		}
+	// In group chats, ignore any commands or messages unless explicitly tagged
+	if isGroup && !isTagged {
+		// Ignore messages not tagged
 		return "", nil
 	}
 
-	// In group chats, ignore any commands other than those explicitly tagged
-	if isGroup && !isTagged {
-		// Ignore messages not tagged
+	// Handle commands
+	if strings.HasPrefix(message.Text, "/") {
+		// Check if the command is explicitly tagged in a group chat
+		if isGroup && !isTagged {
+			// Ignore commands in group chats if not tagged
+			return "", nil
+		}
+		_, err := th.Processor.HandleCommand(message, userID, username)
+		if err != nil {
+			log.Printf("Error handling command: %v", err)
+			return "", nil
+		}
 		return "", nil
 	}
 
@@ -122,31 +128,24 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 		return "", errors.New("no document found in the message")
 	}
 
-	// Only accept text files
-	if !strings.HasSuffix(strings.ToLower(document.FileName), ".txt") {
-		errMsg := "❌ *Unsupported File Type*\n\nPlease upload a .txt file containing your source code."
-		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
-			log.Printf("Failed to send unsupported file type message: %v", err)
-		}
-		return "", nil
-	}
-
 	// Determine chat type
 	chatType := message.Chat.Type
 	isGroup := chatType == "group" || chatType == "supergroup"
 
-	// In group chats, ensure caption contains @BOT_USERNAME
-	if isGroup && message.Text != "" && !strings.Contains(strings.ToLower(message.Text), "@"+strings.ToLower(th.Processor.GetBotUsername())) {
-		errMsg := fmt.Sprintf("❌ *Upload Tag Missing*\n\nPlease tag me using @%s in the caption to upload files in group chats.", th.Processor.GetBotUsername())
-		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
-			log.Printf("Failed to send upload tag missing message: %v", err)
+	// In group chats, ignore file uploads unless explicitly tagged
+	if isGroup {
+		if message.Text == "" || !strings.Contains(strings.ToLower(message.Text), "@"+strings.ToLower(th.Processor.GetBotUsername())) {
+			// Ignore file uploads in group chats if not tagged
+			return "", nil
 		}
-		return "", nil
 	}
 
-	// If in group and tagged, proceed; otherwise, in private chat, proceed
-	if isGroup && !strings.Contains(strings.ToLower(message.Text), "@"+strings.ToLower(th.Processor.GetBotUsername())) {
-		// Should not reach here due to earlier checks
+	// Only accept text files
+	if !strings.HasSuffix(strings.ToLower(document.FileName), ".txt") {
+		errMsg := "❌ *Unsupported File Type*\n\nPlease upload a `.txt` file containing your source code."
+		if err := th.Processor.SendMessage(message.Chat.ID, errMsg, message.MessageID); err != nil {
+			log.Printf("Failed to send unsupported file type message: %v", err)
+		}
 		return "", nil
 	}
 
@@ -209,7 +208,7 @@ func (th *TelegramHandler) HandleDocument(message *types.TelegramMessage) (strin
 	}
 
 	analysisMsg := fmt.Sprintf(
-		"📄 *Code Analysis Summary:*\n\n%s\n\nYou can reference your source code using `#source_code` in your questions.",
+		"🔍 *Code Analysis Summary:*\n\n%s\n\nYou can reference your source code using `#source_code` in your questions.",
 		summary,
 	)
 	if err := th.Processor.SendMessage(message.Chat.ID, analysisMsg, message.MessageID); err != nil {
@@ -249,7 +248,7 @@ func (th *TelegramHandler) getFileURL(fileID string) (string, error) {
 
 // downloadFile downloads the file content from the given URL.
 func (th *TelegramHandler) downloadFile(url string) (string, error) {
-	resp, err := http.Get(url)
+	resp, err := th.client.Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -275,4 +274,50 @@ func isTaggedMention(mention, botUsername string) bool {
 // removeMention removes the bot mention from the user's message.
 func removeMention(text, mention string) string {
 	return strings.TrimSpace(strings.Replace(text, mention, "", 1))
+}
+
+// FetchUpdates fetches updates from Telegram using long polling.
+// It maintains the offset to ensure each update is processed only once.
+func (th *TelegramHandler) FetchUpdates() ([]types.TelegramUpdate, error) {
+	// Retrieve the Telegram token from the processor
+	token := th.Processor.GetTelegramToken()
+	if token == "" {
+		return nil, errors.New("telegram token not found")
+	}
+
+	th.mutex.Lock()
+	defer th.mutex.Unlock()
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?timeout=100&offset=%d", token, th.offset+1)
+
+	resp, err := th.client.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get updates from Telegram: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("telegram getUpdates responded with status %s: %s", resp.Status, string(bodyBytes))
+	}
+
+	var updatesResponse types.TelegramUpdatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&updatesResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode Telegram updates response: %v", err)
+	}
+
+	if !updatesResponse.OK {
+		return nil, fmt.Errorf("telegram getUpdates returned not ok: %v", updatesResponse)
+	}
+
+	updates := updatesResponse.Result
+
+	// Update the offset
+	for _, update := range updates {
+		if update.UpdateID > th.offset {
+			th.offset = update.UpdateID
+		}
+	}
+
+	return updates, nil
 }

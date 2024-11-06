@@ -5,15 +5,16 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/csv"
 	"encoding/json"
-	"errors" // Added for error handling
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,13 +28,12 @@ import (
 	"KernelSandersBot/internal/telegram"
 	"KernelSandersBot/internal/types"
 	"KernelSandersBot/internal/usage"
-	"KernelSandersBot/internal/utils"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	"github.com/russross/blackfriday/v2"
-	"golang.org/x/time/rate"
 )
 
 // Ensure App implements handlers.MessageProcessor
@@ -47,7 +47,6 @@ type App struct {
 	BotUsername          string
 	Cache                *cache.Cache
 	HTTPClient           *http.Client
-	RateLimiter          *rate.Limiter
 	S3BucketName         string
 	S3Client             s3client.S3ClientInterface
 	UsageCache           *usage.UsageCache
@@ -95,7 +94,6 @@ func NewApp() *App {
 		BotUsername:          os.Getenv("BOT_USERNAME"),
 		Cache:                cache.NewCache(),
 		HTTPClient:           &http.Client{Timeout: 15 * time.Second},
-		RateLimiter:          rate.NewLimiter(rate.Every(time.Second), 5),
 		S3BucketName:         os.Getenv("BUCKET_NAME"),
 		S3Client:             s3Client,
 		UsageCache:           usage.NewUsageCache(),
@@ -116,15 +114,15 @@ func NewApp() *App {
 	// Initialize TelegramHandler with the App as the MessageProcessor
 	app.TelegramHandler = telegram.NewTelegramHandler(app)
 
-	// Start the cleanup goroutine for ResponseStore
-	// Note: The cleanup is handled within ResponseStore, so no additional cleanup is needed here.
-
 	return app
 }
 
 // parseNoLimitUsers parses the NO_LIMIT_USERS environment variable into a map of user IDs.
 func parseNoLimitUsers(raw string) map[int]struct{} {
 	userMap := make(map[int]struct{})
+	if raw == "" {
+		return userMap
+	}
 	ids := strings.Split(raw, ",")
 	for _, idStr := range ids {
 		idStr = strings.TrimSpace(idStr)
@@ -238,7 +236,7 @@ func (a *App) HandleWebRequest(w http.ResponseWriter, r *http.Request) {
 			navigator.clipboard.writeText(rawContent).then(function() {
 				alert("RAW code copied to clipboard!");
 			}, function(err) {
-				alert("Failed to copy: ", err);
+				alert("Failed to copy: " + err);
 			});
 		}
 	</script>
@@ -302,9 +300,25 @@ func (a *App) ProcessMessage(chatID int64, userID int, username, userQuestion st
 			userQuestion = strings.ReplaceAll(strings.ToLower(userQuestion), "#source_code", sourceCode)
 		} else {
 			// Inform the user that no source code is available
-			errMsg := "❗ *No Source Code Found*\n\nYou have not uploaded any source code yet. Please upload a `.txt` file using the /upload command."
+			errMsg := "❌ *No Source Code Found*\n\nYou have not uploaded any source code yet. Please upload a `.txt` file using the /upload command."
 			if err := a.SendMessage(chatID, errMsg, messageID); err != nil {
 				log.Printf("Failed to send no source code message: %v", err)
+			}
+			return nil
+		}
+	}
+
+	// Detect and replace '#source_repo' reference with actual repository content
+	if strings.Contains(strings.ToLower(userQuestion), "#source_repo") {
+		sourceRepo, hasRepo := a.GetUserSourceRepo(userID)
+		if hasRepo {
+			// Replace '#source_repo' with the actual repository content
+			userQuestion = strings.ReplaceAll(strings.ToLower(userQuestion), "#source_repo", sourceRepo)
+		} else {
+			// Inform the user that no source repository is available
+			errMsg := "❌ *No Source Repository Found*\n\nYou have not shared any source repository yet. Please share a repository using the /source_repo command."
+			if err := a.SendMessage(chatID, errMsg, messageID); err != nil {
+				log.Printf("Failed to send no source repository message: %v", err)
 			}
 			return nil
 		}
@@ -386,6 +400,314 @@ func (a *App) ProcessMessage(chatID int64, userID int, username, userQuestion st
 	return nil
 }
 
+// HandleCommand processes Telegram commands.
+func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username string) (string, error) {
+	return a.HandleSpecificCommand(strings.TrimSuffix(message.Text, "@"+a.BotUsername), message, userID, username)
+}
+
+// HandleSpecificCommand processes commands with bot mentions.
+func (a *App) HandleSpecificCommand(command string, message *types.TelegramMessage, userID int, username string) (string, error) {
+	switch command {
+	case "/mydata":
+		myData, err := a.GetUserData(userID)
+		if err != nil {
+			log.Printf("Failed to retrieve user data: %v", err)
+			errorMsg := "✅ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
+			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
+			return "", err
+		}
+		err = a.SendMessage(message.Chat.ID, myData, message.MessageID)
+		return "", err
+	case "/security":
+		securityMsg := fmt.Sprintf(
+			"🔒 *Security Information:*\n\n" +
+				"Your data and responses are handled with the utmost security. Uploaded files and shared repositories are stored securely in S3 with strict access controls and are automatically deleted after 4 hours. All interactions are logged for auditing purposes.\n\n" +
+				"The project's source code is open-source, allowing for community review and contributions. You can view the code on GitHub here: [KernelSanders GitHub](https://github.com/joelradon/KernelSanders).\n\n" +
+				"Feel free to review the code and contribute to its development!\n\n" +
+				"✅ *Delete Your Data:* Use /delete_my_data to remove all your uploaded files, shared repositories, and web responses.",
+		)
+		err := a.SendMessage(message.Chat.ID, securityMsg, message.MessageID)
+		return "", err
+	case "/project":
+		projectMsg := "🎮 *KernelSanders Project:*\n\n" +
+			"The KernelSanders bot is an open-source project designed to assist you with your coding needs. Contributions are welcome! You can view the source code and contribute on GitHub: <a href=\"https://github.com/joelradon/KernelSanders\">KernelSanders GitHub</a>.\n\n" +
+			"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕"
+		err := a.SendMessage(message.Chat.ID, projectMsg, message.MessageID)
+		return "", err
+	case "/my_source_code":
+		mySourceCodeMsg := fmt.Sprintf(
+			"# Overview\n\n"+
+				"These scripts facilitate the preparation and management of source code files, allowing users to easily gather and format their code for AI interactions with KernelSanders. By excluding certain files and ensuring only relevant file types are processed, they optimize the user’s experience when interacting with the AI bot.\n\n"+
+				"Both scripts are designed to:\n"+
+				"- List all files in the current directory and its subdirectories.\n"+
+				"- Print the contents of each file, excluding README.md.\n"+
+				"- Copy the output to the clipboard for easy pasting.\n\n"+
+				"Create a source code text file and upload it to Telegram. It will be stored for 4 hours and linked directly to your username. After that, it will be deleted.\n\n"+
+				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.bash\n"+
+				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.ps1\n\n"+
+				"**REMEMBER TO NEVER PUT SENSITIVE CODE ANYWHERE.** While this bot has a private store for each user and deletes each file after 4 hours, practice safe coding and don't put any sensitive information in your code base.\n\n"+
+				"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
+			a.BotUsername,
+		)
+		err := a.SendMessage(message.Chat.ID, mySourceCodeMsg, message.MessageID)
+		return "", err
+	case "/source_repo":
+		// Handle the /source_repo command
+		// Extract the repository URL from the message
+		repoURL, err := extractRepoURL(message.Text, "/source_repo")
+		if err != nil {
+			errMsg := "❌ *Invalid Command Usage*\n\nPlease provide a valid GitHub repository URL after the /source_repo command."
+			if sendErr := a.SendMessage(message.Chat.ID, errMsg, message.MessageID); sendErr != nil {
+				log.Printf("Failed to send invalid command usage message: %v", sendErr)
+			}
+			return "", err
+		}
+
+		// Process the repository: download, zip, upload to S3
+		repoZipURL, err := a.ProcessSourceRepo(userID, repoURL)
+		if err != nil {
+			log.Printf("Failed to process source repository: %v", err)
+			errMsg := "❌ *Repository Processing Error*\n\nFailed to process the shared repository. Please ensure the URL is correct and accessible."
+			if sendErr := a.SendMessage(message.Chat.ID, errMsg, message.MessageID); sendErr != nil {
+				log.Printf("Failed to send repository processing error message: %v", sendErr)
+			}
+			return "", err
+		}
+
+		// Confirmation message
+		confirmationMsg := fmt.Sprintf(
+			"✅ *Repository Shared Successfully*\n\nYour repository has been shared and is accessible until:\n\n"+
+				"• *Deletion Time:* UTC: %s | EDT: %s\n\n"+
+				"Use `#source_repo` to reference this repository in your messages.",
+			time.Now().Add(types.FileRetentionTime).UTC().Format(time.RFC1123),
+			time.Now().Add(types.FileRetentionTime).In(time.FixedZone("EDT", -4*3600)).Format(time.RFC1123),
+		)
+		if err := a.SendMessage(message.Chat.ID, confirmationMsg, message.MessageID); err != nil {
+			log.Printf("Failed to send repository sharing confirmation message: %v", err)
+		}
+
+		// Send the URL to the user
+		repoShareMsg := fmt.Sprintf("🚀 *Repository URL:*\n\n<a href=\"%s\">%s</a>", repoZipURL, "source_repo.zip")
+		if err := a.SendMessage(message.Chat.ID, repoShareMsg, message.MessageID); err != nil {
+			log.Printf("Failed to send repository URL message: %v", err)
+		}
+
+		return "", nil
+	case "/delete_my_data":
+		deleteMsg, err := a.DeleteUserData(userID)
+		if err != nil {
+			log.Printf("Failed to delete user data: %v", err)
+			errorMsg := "✅ *Error Deleting Data*\n\nUnable to delete your data at this time. Please try again later."
+			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
+			return "", err
+		}
+		err = a.SendMessage(message.Chat.ID, deleteMsg, message.MessageID)
+		return "", err
+	default:
+		unknownCmd := "❔ *Unknown command.* Type /help to see available commands."
+		err := a.SendMessage(message.Chat.ID, unknownCmd, message.MessageID)
+		return "", err
+	}
+}
+
+// extractRepoURL extracts the repository URL from the command message.
+func extractRepoURL(text, command string) (string, error) {
+	parts := strings.SplitN(text, " ", 2)
+	if len(parts) < 2 {
+		return "", errors.New("repository URL not provided")
+	}
+	repoURL := strings.TrimSpace(parts[1])
+	return repoURL, nil
+}
+
+// GetUserData retrieves the user's uploaded files, shared repositories, and web responses.
+func (a *App) GetUserData(userID int) (string, error) {
+	// Retrieve uploaded source code files from S3
+	sourceFiles, err := a.ListUserSourceFiles(userID)
+	if err != nil {
+		return "", err
+	}
+
+	// Retrieve shared repositories from S3
+	sourceRepos, err := a.ListUserSourceRepos(userID)
+	if err != nil {
+		return "", err
+	}
+
+	// Retrieve web responses from ResponseStore (now persisted in S3)
+	responses, err := a.ResponseStore.GetUserResponsesByUserID(userID)
+	if err != nil {
+		return "", err
+	}
+
+	// Build the response message
+	var sb strings.Builder
+	sb.WriteString("✅ *Your Data:*\n\n")
+
+	if len(sourceFiles) > 0 {
+		sb.WriteString("*Uploaded Source Code Files:*\n")
+		for _, file := range sourceFiles {
+			fileURL := a.GenerateFileURL(file.FileName)
+			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">%s</a>\n", fileURL, filepath.Base(file.FileName)))
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("*No uploaded source code files found.*\n\n")
+	}
+
+	if len(sourceRepos) > 0 {
+		sb.WriteString("*Shared Repositories:*\n")
+		for _, repo := range sourceRepos {
+			repoURL := a.GenerateRepoURL(repo.FileName)
+			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">%s</a>\n", repoURL, "source_repo.zip"))
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("*No shared repositories found.*\n\n")
+	}
+
+	if len(responses) > 0 {
+		sb.WriteString("*Web Responses:*\n")
+		for _, resp := range responses {
+			responseURL := a.GenerateResponseURL(resp.ID)
+			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">Response ID: %s</a>\n", responseURL, resp.ID))
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("*No web responses found.*\n")
+	}
+
+	return sb.String(), nil
+}
+
+// ListUserSourceFiles lists all uploaded source code files for a user by querying S3.
+func (a *App) ListUserSourceFiles(userID int) ([]types.UserFile, error) {
+	prefix := fmt.Sprintf("user_source_code/%d/", userID)
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(a.S3BucketName),
+		Prefix: aws.String(prefix),
+	}
+
+	var files []types.UserFile
+
+	err := a.S3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		for _, obj := range page.Contents {
+			// Retrieve metadata to get upload time
+			headInput := &s3.HeadObjectInput{
+				Bucket: aws.String(a.S3BucketName),
+				Key:    aws.String(*obj.Key),
+			}
+			headResp, err := a.S3Client.HeadObject(headInput)
+			if err != nil {
+				log.Printf("Failed to retrieve metadata for object %s: %v", *obj.Key, err)
+				continue
+			}
+
+			uploadedAtStr, exists := headResp.Metadata["uploaded_at"]
+			if !exists || uploadedAtStr == nil {
+				log.Printf("No 'uploaded_at' metadata for object %s. Skipping.", *obj.Key)
+				continue
+			}
+
+			uploadedAt, err := time.Parse(time.RFC3339, *uploadedAtStr)
+			if err != nil {
+				log.Printf("Invalid 'uploaded_at' format for object %s: %v", *obj.Key, err)
+				continue
+			}
+
+			deletionTime := uploadedAt.Add(types.FileRetentionTime)
+
+			files = append(files, types.UserFile{
+				FileName:        *obj.Key,
+				UploadedAtUTC:   uploadedAt.UTC(),
+				UploadedAtEDT:   uploadedAt.In(time.FixedZone("EDT", -4*3600)),
+				DeletionTimeUTC: deletionTime.UTC(),
+				DeletionTimeEDT: deletionTime.In(time.FixedZone("EDT", -4*3600)),
+			})
+		}
+		return true // Continue to next page
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return files, nil
+}
+
+// ListUserSourceRepos lists all shared repositories for a user by querying S3.
+func (a *App) ListUserSourceRepos(userID int) ([]types.UserFile, error) {
+	prefix := fmt.Sprintf("user_source_repo/%d/", userID)
+	input := &s3.ListObjectsV2Input{
+		Bucket: aws.String(a.S3BucketName),
+		Prefix: aws.String(prefix),
+	}
+
+	var repos []types.UserFile
+
+	err := a.S3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+		for _, obj := range page.Contents {
+			// Retrieve metadata to get upload time
+			headInput := &s3.HeadObjectInput{
+				Bucket: aws.String(a.S3BucketName),
+				Key:    aws.String(*obj.Key),
+			}
+			headResp, err := a.S3Client.HeadObject(headInput)
+			if err != nil {
+				log.Printf("Failed to retrieve metadata for object %s: %v", *obj.Key, err)
+				continue
+			}
+
+			uploadedAtStr, exists := headResp.Metadata["uploaded_at"]
+			if !exists || uploadedAtStr == nil {
+				log.Printf("No 'uploaded_at' metadata for object %s. Skipping.", *obj.Key)
+				continue
+			}
+
+			uploadedAt, err := time.Parse(time.RFC3339, *uploadedAtStr)
+			if err != nil {
+				log.Printf("Invalid 'uploaded_at' format for object %s: %v", *obj.Key, err)
+				continue
+			}
+
+			deletionTime := uploadedAt.Add(types.FileRetentionTime)
+
+			repos = append(repos, types.UserFile{
+				FileName:        *obj.Key,
+				UploadedAtUTC:   uploadedAt.UTC(),
+				UploadedAtEDT:   uploadedAt.In(time.FixedZone("EDT", -4*3600)),
+				DeletionTimeUTC: deletionTime.UTC(),
+				DeletionTimeEDT: deletionTime.In(time.FixedZone("EDT", -4*3600)),
+			})
+		}
+		return true // Continue to next page
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return repos, nil
+}
+
+// GenerateRepoURL generates the download URL for the shared repository.
+func (a *App) GenerateRepoURL(fileName string) string {
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+	return fmt.Sprintf("%s/files/%s", baseURL, fileName)
+}
+
+// GenerateFileURL generates the download URL for the uploaded file.
+func (a *App) GenerateFileURL(fileName string) string {
+	baseURL := os.Getenv("BASE_URL")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+	return fmt.Sprintf("%s/files/%s", baseURL, fileName)
+}
+
 // GenerateResponseURL generates the URL for the stored response.
 func (a *App) GenerateResponseURL(responseID string) string {
 	baseURL := os.Getenv("BASE_URL")
@@ -447,388 +769,179 @@ func (a *App) HandleUpdate(update *types.TelegramUpdate) {
 	a.TelegramHandler.HandleTelegramMessage(update)
 }
 
-// HandleCommand processes Telegram commands.
-func (a *App) HandleCommand(message *types.TelegramMessage, userID int, username string) (string, error) {
-	switch {
-	case strings.HasPrefix(message.Text, "/mydata@"+a.BotUsername):
-		// Extract the command without the bot username
-		command := "/mydata"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	case strings.HasPrefix(message.Text, "/upload@"+a.BotUsername):
-		// Any attempt to use "/upload@BOT_USERNAME" in group chats will be handled in telegram_handler.go
-		command := "/upload"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	case strings.HasPrefix(message.Text, "/security@"+a.BotUsername):
-		command := "/security"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	case strings.HasPrefix(message.Text, "/project@"+a.BotUsername):
-		command := "/project"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	case strings.HasPrefix(message.Text, "/my_source_code@"+a.BotUsername):
-		command := "/my_source_code"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	case strings.HasPrefix(message.Text, "/delete_my_data@"+a.BotUsername):
-		command := "/delete_my_data"
-		return a.HandleSpecificCommand(command, message, userID, username)
-	default:
-		switch message.Text {
-		case "/start":
-			welcomeMsg := "✅ *Welcome to Kernel Sanders Bot!*\n\nYou can ask me questions about your application or upload your source code files for more context."
-			err := a.SendMessage(message.Chat.ID, welcomeMsg, message.MessageID)
-			return "", err
-		case "/help":
-			helpMsg := fmt.Sprintf(
-				"✅ *Help Menu:*\n\n"+
-					"*Commands:*\n"+
-					"/start - Start interacting with the bot\n"+
-					"/help - Show this help message\n"+
-					"/upload - Upload your source code file (only .txt files are supported)\n"+
-					"/mydata - View your uploaded files and web responses\n"+
-					"/delete_my_data - Delete all your uploaded data and web responses\n"+
-					"/security - Learn about the bot's security measures\n"+
-					"/project - Learn about the KernelSanders project and how to contribute\n"+
-					"/my_source_code - Get scripts to prepare your source code for upload\n\n"+
-					"*File Uploads:*\n"+
-					"In group chats, upload .txt files by tagging me in the caption using @%s. In 1-on-1 chats, simply send the .txt file without tagging.\n\n"+
-					"These files will be stored for *4 hours* only. Uploading a new file will overwrite the existing one and reset the storage time.\n\n"+
-					"*Short-Lived Web Responses:*\n"+
-					"The bot provides short-lived web response links for easier reading and navigation of your code outputs. Please save any outputs or files you wish to use for long-term purposes, as the web responses will expire after the specified duration.\n\n"+
-					"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
-				a.BotUsername,
-			)
-			err := a.SendMessage(message.Chat.ID, helpMsg, message.MessageID)
-			return "", err
-		case "/upload":
-			// This message will be handled in telegram_handler.go
-			uploadMsg := "✅ *Upload Command Removed in Group Chats*\n\nFor privacy reasons, please message me directly by clicking @" + a.BotUsername + " to upload your source code files."
-			err := a.SendMessage(message.Chat.ID, uploadMsg, message.MessageID)
-			return "", err
-		case "/mydata":
-			myData, err := a.GetUserData(userID)
-			if err != nil {
-				log.Printf("Failed to retrieve user data: %v", err)
-				errorMsg := "✅ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
-				a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
-				return "", err
-			}
-			err = a.SendMessage(message.Chat.ID, myData, message.MessageID)
-			return "", err
-		case "/security":
-			securityMsg := fmt.Sprintf(
-				"🔒 *Security Information:*\n\n" +
-					"Your data and responses are handled with the utmost security. Uploaded files are stored securely in S3 with strict access controls and are automatically deleted after 4 hours. All interactions are logged for auditing purposes.\n\n" +
-					"The project's source code is open-source, allowing for community review and contributions. You can view the code on GitHub here: [KernelSanders GitHub](https://github.com/joelradon/KernelSanders).\n\n" +
-					"Feel free to review the code and contribute to its development!\n\n" +
-					"✅ *Delete Your Data:* Use /delete_my_data to remove all your uploaded files and web responses.",
-			)
-			err := a.SendMessage(message.Chat.ID, securityMsg, message.MessageID)
-			return "", err
-		case "/project":
-			projectMsg := "🌟 *KernelSanders Project:*\n\n" +
-				"The KernelSanders bot is an open-source project designed to assist you with your coding needs. Contributions are welcome! You can view the source code and contribute on GitHub: <a href=\"https://github.com/joelradon/KernelSanders\">KernelSanders GitHub</a>.\n\n" +
-				"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕"
-			err := a.SendMessage(message.Chat.ID, projectMsg, message.MessageID)
-			return "", err
-		case "/my_source_code":
-			mySourceCodeMsg := fmt.Sprintf(
-				"# Overview\n\n"+
-					"These scripts facilitate the preparation and management of source code files, allowing users to easily gather and format their code for AI interactions with KernelSanders. By excluding certain files and ensuring only relevant file types are processed, they optimize the user’s experience when interacting with the AI bot.\n\n"+
-					"Both scripts are designed to:\n"+
-					"- List all files in the current directory and its subdirectories.\n"+
-					"- Print the contents of each file, excluding README.md.\n"+
-					"- Copy the output to the clipboard for easy pasting.\n\n"+
-					"Create a source code text file and upload it to Telegram. It will be stored for 4 hours and linked directly to your username. After that, it will be deleted.\n\n"+
-					"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.bash\n"+
-					"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.ps1\n\n"+
-					"**REMEMBER TO NEVER PUT SENSITIVE CODE ANYWHERE.** While this bot has a private store for each user and deletes each file after 4 hours, practice safe coding and don't put any sensitive information in your code base.\n\n"+
-					"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
-				a.BotUsername,
-			)
-			err := a.SendMessage(message.Chat.ID, mySourceCodeMsg, message.MessageID)
-			return "", err
-		case "/delete_my_data":
-			deleteMsg, err := a.DeleteUserData(userID)
-			if err != nil {
-				log.Printf("Failed to delete user data: %v", err)
-				errorMsg := "✅ *Error Deleting Data*\n\nUnable to delete your data at this time. Please try again later."
-				a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
-				return "", err
-			}
-			err = a.SendMessage(message.Chat.ID, deleteMsg, message.MessageID)
-			return "", err
-		default:
-			unknownCmd := "❓ *Unknown command.* Type /help to see available commands."
-			err := a.SendMessage(message.Chat.ID, unknownCmd, message.MessageID)
-			return "", err
+// HandleRepositoryShare processes the shared repository URL by the user.
+func (a *App) HandleRepositoryShare(chatID int64, userID int, username, repoURL string, messageID int) error {
+	// Validate the GitHub repository URL
+	if !isValidGitHubURL(repoURL) {
+		errMsg := "❌ *Invalid Repository URL*\n\nPlease provide a valid GitHub repository URL after the /source_repo command."
+		if err := a.SendMessage(chatID, errMsg, messageID); err != nil {
+			log.Printf("Failed to send invalid repository URL message: %v", err)
 		}
+		return errors.New("invalid repository URL")
 	}
-}
 
-// HandleSpecificCommand processes commands with bot mentions.
-func (a *App) HandleSpecificCommand(command string, message *types.TelegramMessage, userID int, username string) (string, error) {
-	switch command {
-	case "/mydata":
-		myData, err := a.GetUserData(userID)
-		if err != nil {
-			log.Printf("Failed to retrieve user data: %v", err)
-			errorMsg := "✅ *Error Retrieving Data*\n\nUnable to fetch your data at this time. Please try again later."
-			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
-			return "", err
-		}
-		err = a.SendMessage(message.Chat.ID, myData, message.MessageID)
-		return "", err
-	case "/security":
-		securityMsg := fmt.Sprintf(
-			"🔒 *Security Information:*\n\n" +
-				"Your data and responses are handled with the utmost security. Uploaded files are stored securely in S3 with strict access controls and are automatically deleted after 4 hours. All interactions are logged for auditing purposes.\n\n" +
-				"The project's source code is open-source, allowing for community review and contributions. You can view the code on GitHub here: [KernelSanders GitHub](https://github.com/joelradon/KernelSanders).\n\n" +
-				"Feel free to review the code and contribute to its development!\n\n" +
-				"✅ *Delete Your Data:* Use /delete_my_data to remove all your uploaded files and web responses.",
-		)
-		err := a.SendMessage(message.Chat.ID, securityMsg, message.MessageID)
-		return "", err
-	case "/project":
-		projectMsg := "🌟 *KernelSanders Project:*\n\n" +
-			"The KernelSanders bot is an open-source project designed to assist you with your coding needs. Contributions are welcome! You can view the source code and contribute on GitHub: <a href=\"https://github.com/joelradon/KernelSanders\">KernelSanders GitHub</a>.\n\n" +
-			"If you find this tool useful, consider buying me a coffee: <a href=\"https://paypal.me/joelradon\">Buy me a Coffee</a>. Your support is greatly appreciated! ☕"
-		err := a.SendMessage(message.Chat.ID, projectMsg, message.MessageID)
-		return "", err
-	case "/my_source_code":
-		mySourceCodeMsg := fmt.Sprintf(
-			"# Overview\n\n"+
-				"These scripts facilitate the preparation and management of source code files, allowing users to easily gather and format their code for AI interactions with KernelSanders. By excluding certain files and ensuring only relevant file types are processed, they optimize the user’s experience when interacting with the AI bot.\n\n"+
-				"Both scripts are designed to:\n"+
-				"- List all files in the current directory and its subdirectories.\n"+
-				"- Print the contents of each file, excluding README.md.\n"+
-				"- Copy the output to the clipboard for easy pasting.\n\n"+
-				"Create a source code text file and upload it to Telegram. It will be stored for 4 hours and linked directly to your username. After that, it will be deleted.\n\n"+
-				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.bash\n"+
-				"(short link)https://github.com/joelradon/KernelSanders/blob/main/utility_scripts/copy_source_code.ps1\n\n"+
-				"**REMEMBER TO NEVER PUT SENSITIVE CODE ANYWHERE.** While this bot has a private store for each user and deletes each file after 4 hours, practice safe coding and don't put any sensitive information in your code base.\n\n"+
-				"✅ *Reference Source Code:* After uploading your source code, you can reference it in your messages using `#source_code`. The bot will utilize your uploaded code to provide context-aware responses as long as the file is stored.",
-			a.BotUsername,
-		)
-		err := a.SendMessage(message.Chat.ID, mySourceCodeMsg, message.MessageID)
-		return "", err
-	case "/delete_my_data":
-		deleteMsg, err := a.DeleteUserData(userID)
-		if err != nil {
-			log.Printf("Failed to delete user data: %v", err)
-			errorMsg := "✅ *Error Deleting Data*\n\nUnable to delete your data at this time. Please try again later."
-			a.SendMessage(message.Chat.ID, errorMsg, message.MessageID)
-			return "", err
-		}
-		err = a.SendMessage(message.Chat.ID, deleteMsg, message.MessageID)
-		return "", err
-	default:
-		unknownCmd := "❓ *Unknown command.* Type /help to see available commands."
-		err := a.SendMessage(message.Chat.ID, unknownCmd, message.MessageID)
-		return "", err
-	}
-}
-
-// GetUserData retrieves the user's uploaded files and web responses.
-func (a *App) GetUserData(userID int) (string, error) {
-	// Retrieve uploaded files from S3
-	files, err := a.ListUserFiles(userID)
+	// Process the repository: download, zip, upload to S3
+	repoZipURL, err := a.ProcessSourceRepo(userID, repoURL)
 	if err != nil {
-		return "", err
+		log.Printf("Failed to process source repository: %v", err)
+		errMsg := "❌ *Repository Processing Error*\n\nFailed to process the shared repository. Please ensure the URL is correct and accessible."
+		if err := a.SendMessage(chatID, errMsg, messageID); err != nil {
+			log.Printf("Failed to send repository processing error message: %v", err)
+		}
+		return err
 	}
 
-	// Retrieve web responses from ResponseStore (now persisted in S3)
-	responses, err := a.ResponseStore.GetUserResponsesByUserID(userID)
+	// Confirmation message
+	confirmationMsg := fmt.Sprintf(
+		"✅ *Repository Shared Successfully*\n\nYour repository has been shared and is accessible until:\n\n"+
+			"• *Deletion Time:* UTC: %s | EDT: %s\n\n"+
+			"Use `#source_repo` to reference this repository in your messages.",
+		time.Now().Add(types.FileRetentionTime).UTC().Format(time.RFC1123),
+		time.Now().Add(types.FileRetentionTime).In(time.FixedZone("EDT", -4*3600)).Format(time.RFC1123),
+	)
+	if err := a.SendMessage(chatID, confirmationMsg, messageID); err != nil {
+		log.Printf("Failed to send repository sharing confirmation message: %v", err)
+	}
+
+	// Send the URL to the user
+	repoShareMsg := fmt.Sprintf("🚀 *Repository URL:*\n\n<a href=\"%s\">%s</a>", repoZipURL, "source_repo.zip")
+	if err := a.SendMessage(chatID, repoShareMsg, messageID); err != nil {
+		log.Printf("Failed to send repository URL message: %v", err)
+	}
+
+	return nil
+}
+
+// isValidGitHubURL validates if the provided URL is a valid GitHub repository URL.
+func isValidGitHubURL(url string) bool {
+	lowerURL := strings.ToLower(url)
+	return strings.HasPrefix(lowerURL, "https://github.com/") || strings.HasPrefix(lowerURL, "http://github.com/")
+}
+
+// DeleteUserData deletes all uploaded source code files, shared repositories, and web responses for a user.
+func (a *App) DeleteUserData(userID int) (string, error) {
+	// Delete source code files
+	sourceCodeKey := fmt.Sprintf("user_source_code/%d/source_code.txt", userID)
+	_, err := a.S3Client.DeleteObject(&s3.DeleteObjectInput{
+		Bucket: aws.String(a.S3BucketName),
+		Key:    aws.String(sourceCodeKey),
+	})
 	if err != nil {
+		log.Printf("Failed to delete source code from S3 for user %d: %v", userID, err)
 		return "", err
 	}
 
-	// Build the response message
-	var sb strings.Builder
-	sb.WriteString("✅ *Your Data:*\n\n")
-
-	if len(files) > 0 {
-		sb.WriteString("*Uploaded Files:*\n")
-		for _, file := range files {
-			fileURL := a.GenerateFileURL(file.FileName)
-			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">%s</a>\n", fileURL, file.FileName))
-		}
-		sb.WriteString("\n")
-	} else {
-		sb.WriteString("*No uploaded files found.*\n\n")
-	}
-
-	if len(responses) > 0 {
-		sb.WriteString("*Web Responses:*\n")
-		for _, resp := range responses {
-			responseURL := a.GenerateResponseURL(resp.ID)
-			sb.WriteString(fmt.Sprintf("- <a href=\"%s\">Response ID: %s</a>\n", responseURL, resp.ID))
-		}
-		sb.WriteString("\n")
-	} else {
-		sb.WriteString("*No web responses found.*\n")
-	}
-
-	return sb.String(), nil
-}
-
-// GenerateFileURL generates the download URL for the uploaded file.
-func (a *App) GenerateFileURL(fileName string) string {
-	baseURL := os.Getenv("BASE_URL")
-	if baseURL == "" {
-		baseURL = "http://localhost:8080"
-	}
-	return fmt.Sprintf("%s/files/%s", baseURL, fileName)
-}
-
-// ListUserFiles lists all uploaded files for a user by querying S3 directly.
-func (a *App) ListUserFiles(userID int) ([]types.UserFile, error) {
-	prefix := fmt.Sprintf("user_source_code/%d/", userID)
+	// Delete shared repositories
+	prefix := fmt.Sprintf("user_source_repo/%d/", userID)
 	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(a.S3BucketName),
 		Prefix: aws.String(prefix),
 	}
 
-	var files []types.UserFile
-
-	err := a.S3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
+	err = a.S3Client.ListObjectsV2Pages(input, func(page *s3.ListObjectsV2Output, lastPage bool) bool {
 		for _, obj := range page.Contents {
-			// Retrieve metadata to get upload time
-			headInput := &s3.HeadObjectInput{
+			_, delErr := a.S3Client.DeleteObject(&s3.DeleteObjectInput{
 				Bucket: aws.String(a.S3BucketName),
 				Key:    aws.String(*obj.Key),
-			}
-			headResp, err := a.S3Client.HeadObject(headInput)
-			if err != nil {
-				log.Printf("Failed to retrieve metadata for object %s: %v", *obj.Key, err)
-				continue
-			}
-
-			uploadedAtStr, exists := headResp.Metadata["uploaded_at"]
-			if !exists || uploadedAtStr == nil {
-				log.Printf("No 'uploaded_at' metadata for object %s. Skipping.", *obj.Key)
-				continue
-			}
-
-			uploadedAt, err := time.Parse(time.RFC3339, *uploadedAtStr)
-			if err != nil {
-				log.Printf("Invalid 'uploaded_at' format for object %s: %v", *obj.Key, err)
-				continue
-			}
-
-			deletionTime := uploadedAt.Add(types.FileRetentionTime)
-
-			files = append(files, types.UserFile{
-				FileName:        *obj.Key,
-				UploadedAtUTC:   uploadedAt.UTC(),
-				UploadedAtEDT:   uploadedAt.In(time.FixedZone("EDT", -4*3600)),
-				DeletionTimeUTC: deletionTime.UTC(),
-				DeletionTimeEDT: deletionTime.In(time.FixedZone("EDT", -4*3600)),
 			})
+			if delErr != nil {
+				log.Printf("Failed to delete shared repository from S3 for user %d: %v", userID, delErr)
+				continue
+			}
 		}
 		return true // Continue to next page
 	})
-
 	if err != nil {
-		return nil, err
+		log.Printf("Failed to delete shared repositories from S3 for user %d: %v", userID, err)
+		return "", err
 	}
 
-	return files, nil
+	// Delete all web responses associated with the user
+	responses, err := a.ResponseStore.GetUserResponsesByUserID(userID)
+	if err != nil {
+		log.Printf("Failed to retrieve user responses for deletion: %v", err)
+		return "", err
+	}
+
+	for _, resp := range responses {
+		a.ResponseStore.DeleteResponse(resp.ID)
+	}
+
+	deleteMsg := "✅ *Data Deleted Successfully*\n\nAll your uploaded source code files, shared repositories, and web responses have been deleted."
+	return deleteMsg, nil
 }
 
-// Shutdown gracefully shuts down the application, ensuring all goroutines are terminated.
-func (a *App) Shutdown() {
-	close(a.ShutdownChan)
-	a.wg.Wait()
-	log.Println("Application has been shut down gracefully.")
-}
+// ProcessSourceRepo handles the processing of a shared GitHub repository URL.
+func (a *App) ProcessSourceRepo(userID int, repoURL string) (string, error) {
+	// Create a temporary directory
+	tempDir, err := os.MkdirTemp("", "source_repo_*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir) // Clean up after processing
 
-// logToS3 logs user interactions to an S3 bucket with details about rate limiting and usage.
-func (a *App) logToS3(userID int, username, userPrompt, responseTime string, isNoLimitUser bool) {
-	a.logMutex.Lock()
-	defer a.logMutex.Unlock()
-
-	// Extract keywords from the user prompt
-	keywords := utils.ExtractKeywords(userPrompt)
-
-	record := []string{
-		fmt.Sprintf("%d", userID),
-		username,
-		userPrompt,
-		keywords, // Added keywords to the CSV record
-		responseTime,
-		fmt.Sprintf("No limit user: %t", isNoLimitUser),
+	// Clone the repository using git
+	cmd := exec.Command("git", "clone", repoURL, tempDir)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to clone repository: %v - %s", err, stderr.String())
 	}
 
-	bucketName := a.S3BucketName
-	objectKey := "logs/telegram_logs.csv"
-
-	// Check if the CSV file exists
-	_, err := a.S3Client.HeadObject(&s3.HeadObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(objectKey),
-	})
-
-	var existingData [][]string
-	if err == nil {
-		// Object exists, get it
-		getResp, err := a.S3Client.GetObject(&s3.GetObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(objectKey),
-		})
-		if err != nil {
-			log.Printf("Failed to get existing CSV from S3: %v", err)
-		} else {
-			defer getResp.Body.Close()
-			bodyBytes, err := io.ReadAll(getResp.Body)
-			if err == nil && len(bodyBytes) > 0 {
-				reader := csv.NewReader(bytes.NewReader(bodyBytes))
-				existingData, err = reader.ReadAll()
-				if err != nil {
-					log.Printf("Failed to parse existing CSV: %v", err)
-					existingData = [][]string{}
-				}
-			}
-		}
-	} else {
-		// Object does not exist, create new
-		log.Printf("S3 CSV file does not exist. A new one will be created.")
-		existingData = [][]string{}
+	// Compress the repository into a ZIP file
+	zipFileName := "source_repo.zip"
+	zipFilePath := filepath.Join(tempDir, zipFileName)
+	err = zipDirectory(tempDir, zipFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to zip repository: %v", err)
 	}
 
-	if len(existingData) == 0 {
-		headers := []string{
-			"userID",
-			"username",
-			"prompt",
-			"keywords", // Added keywords header
-			"response_time",
-			"no_limit_user",
-		}
-		existingData = append(existingData, headers)
+	// Read the ZIP file content
+	zipContent, err := os.ReadFile(zipFilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read ZIP file: %v", err)
 	}
 
-	existingData = append(existingData, record)
-
-	var buf bytes.Buffer
-	w := csv.NewWriter(&buf)
-	if err := w.WriteAll(existingData); err != nil {
-		log.Printf("Failed to write CSV data to buffer: %v", err)
-		return
+	// Upload the ZIP file to S3
+	objectKey := fmt.Sprintf("user_source_repo/%d/%s", userID, zipFileName)
+	metadata := map[string]*string{
+		"uploaded_at": aws.String(time.Now().Format(time.RFC3339)),
 	}
 
 	_, err = a.S3Client.PutObject(&s3.PutObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(objectKey),
-		Body:   bytes.NewReader(buf.Bytes()),
+		Bucket:   aws.String(a.S3BucketName),
+		Key:      aws.String(objectKey),
+		Body:     bytes.NewReader(zipContent),
+		Metadata: metadata,
 	})
-
 	if err != nil {
-		log.Printf("Failed to upload updated CSV to S3: %v", err)
-	} else {
-		log.Printf("Successfully appended log data to S3 CSV")
+		log.Printf("Failed to upload repository ZIP to S3 for user %d: %v", userID, err)
+		return "", err
 	}
+
+	// Generate a pre-signed URL for the uploaded ZIP file (expires in 4 hours)
+	repoZipURL, err := a.S3Client.GeneratePresignedURL(a.S3BucketName, objectKey, types.FileRetentionTime)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate pre-signed URL: %v", err)
+	}
+
+	return repoZipURL, nil
 }
 
-// StoreUserSourceCode stores the user's source code to S3.
+// zipDirectory compresses the specified directory into a ZIP file at the given destination path.
+func zipDirectory(sourceDir, destZip string) error {
+	// Use the zip command to compress the directory
+	cmd := exec.Command("zip", "-r", destZip, ".")
+	cmd.Dir = sourceDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("zip command failed: %v - %s", err, stderr.String())
+	}
+	return nil
+}
+
+// StoreUserSourceCode stores the user's uploaded source code to S3.
 func (a *App) StoreUserSourceCode(userID int, code string) error {
 	objectKey := fmt.Sprintf("user_source_code/%d/source_code.txt", userID)
 	metadata := map[string]*string{
@@ -848,7 +961,7 @@ func (a *App) StoreUserSourceCode(userID int, code string) error {
 	return nil
 }
 
-// GetUserSourceCode retrieves the user's stored source code from S3.
+// GetUserSourceCode retrieves the user's uploaded source code from S3.
 func (a *App) GetUserSourceCode(userID int) (string, bool) {
 	objectKey := fmt.Sprintf("user_source_code/%d/source_code.txt", userID)
 	resp, err := a.S3Client.GetObject(&s3.GetObjectInput{
@@ -870,32 +983,203 @@ func (a *App) GetUserSourceCode(userID int) (string, bool) {
 	return string(bodyBytes), true
 }
 
-// DeleteUserData deletes all uploaded source code files and web responses for a user.
-func (a *App) DeleteUserData(userID int) (string, error) {
-	// Delete source code files
-	objectKey := fmt.Sprintf("user_source_code/%d/source_code.txt", userID)
-	_, err := a.S3Client.DeleteObject(&s3.DeleteObjectInput{
+// GetUserSourceRepo retrieves the user's shared repository URL from S3.
+func (a *App) GetUserSourceRepo(userID int) (string, bool) {
+	objectKey := fmt.Sprintf("user_source_repo/%d/source_repo.zip", userID)
+	resp, err := a.S3Client.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(a.S3BucketName),
 		Key:    aws.String(objectKey),
 	})
 	if err != nil {
-		log.Printf("Failed to delete source code from S3 for user %d: %v", userID, err)
-		return "", err
+		log.Printf("Failed to retrieve source repository from S3 for user %d: %v", userID, err)
+		return "", false
 	}
+	defer resp.Body.Close()
 
-	// Delete all web responses associated with the user
-	responses, err := a.ResponseStore.GetUserResponsesByUserID(userID)
+	// Since the repository is zipped, we can provide the pre-signed URL directly
+	repoURL := a.GenerateRepoURL(objectKey)
+	return repoURL, true
+}
+
+// ListUserFiles lists all uploaded source code files and shared repositories for a user.
+func (a *App) ListUserFiles(userID int) ([]types.UserFile, error) {
+	var allFiles []types.UserFile
+
+	// List source code files
+	sourceFiles, err := a.ListUserSourceFiles(userID)
 	if err != nil {
-		log.Printf("Failed to retrieve user responses for deletion: %v", err)
-		return "", err
+		return nil, err
+	}
+	allFiles = append(allFiles, sourceFiles...)
+
+	// List shared repositories
+	sourceRepos, err := a.ListUserSourceRepos(userID)
+	if err != nil {
+		return nil, err
+	}
+	allFiles = append(allFiles, sourceRepos...)
+
+	return allFiles, nil
+}
+
+// ProcessRepositoryShare processes the repository sharing.
+func (a *App) ProcessRepositoryShare(chatID int64, userID int, username, repoURL string, messageID int) error {
+	return a.HandleRepositoryShare(chatID, userID, username, repoURL, messageID)
+}
+
+// Shutdown gracefully shuts down the application, ensuring all goroutines are terminated.
+func (a *App) Shutdown() {
+	close(a.ShutdownChan)
+	a.wg.Wait()
+	log.Println("Application has been shut down gracefully.")
+}
+
+// Run starts the application's HTTP server and listens for incoming Telegram updates.
+func (a *App) Run() {
+	// Start the HTTP server for web responses
+	http.HandleFunc("/", a.HandleWebRequest)
+	http.HandleFunc("/files/", a.HandleFileDownload) // Implement HandleFileDownload as needed
+
+	server := &http.Server{
+		Addr: ":" + a.GetPort(),
 	}
 
-	for _, resp := range responses {
-		a.ResponseStore.DeleteResponse(resp.ID)
+	// Start the HTTP server in a separate goroutine
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		log.Printf("Starting HTTP server on port %s", a.GetPort())
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
+
+	// Start Telegram webhook or long polling
+	// Choose one based on configuration
+	// Example: Starting webhook
+	err := a.StartWebhook()
+	if err != nil {
+		log.Printf("Failed to start webhook: %v", err)
+	} else {
+		log.Println("Webhook started successfully.")
 	}
 
-	deleteMsg := "✅ *Data Deleted Successfully*\n\nAll your uploaded files and web responses have been deleted."
-	return deleteMsg, nil
+	// Alternatively, implement long polling
+	// Uncomment the following lines to enable long polling
+	/*
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.ListenLongPoll()
+		}()
+	*/
+
+	// Wait for shutdown signal
+	<-a.ShutdownChan
+
+	// Shutdown the HTTP server gracefully
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("HTTP server Shutdown Failed:%+v", err)
+	}
+}
+
+// GetPort retrieves the port from environment variables or defaults to 8080.
+func (a *App) GetPort() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	return port
+}
+
+// HandleFileDownload handles file download requests.
+func (a *App) HandleFileDownload(w http.ResponseWriter, r *http.Request) {
+	// Extract the file key from the URL
+	fileKey := strings.TrimPrefix(r.URL.Path, "/files/")
+	if fileKey == "" {
+		http.Error(w, "File key not provided.", http.StatusBadRequest)
+		return
+	}
+
+	// Retrieve the file from S3
+	resp, err := a.S3Client.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(a.S3BucketName),
+		Key:    aws.String(fileKey),
+	})
+	if err != nil {
+		log.Printf("Failed to retrieve file %s from S3: %v", fileKey, err)
+		http.Error(w, "File not found.", http.StatusNotFound)
+		return
+	}
+	defer resp.Body.Close()
+
+	// Set appropriate headers
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filepath.Base(fileKey)))
+	w.Header().Set("Content-Type", "application/octet-stream")
+
+	// Stream the file to the response
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		log.Printf("Failed to stream file %s to response: %v", fileKey, err)
+	}
+}
+
+// StartWebhook sets up the Telegram webhook.
+func (a *App) StartWebhook() error {
+	// Retrieve webhook URL from environment variables
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	if webhookURL == "" {
+		return errors.New("WEBHOOK_URL environment variable is not set")
+	}
+
+	// Set the webhook with Telegram
+	setWebhookURL := fmt.Sprintf("https://api.telegram.org/bot%s/setWebhook", a.TelegramToken)
+	payload := map[string]interface{}{
+		"url": webhookURL,
+	}
+
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook payload: %v", err)
+	}
+
+	resp, err := a.HTTPClient.Post(setWebhookURL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to set webhook: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to set webhook, status: %s, body: %s", resp.Status, string(bodyBytes))
+	}
+
+	log.Println("Telegram webhook set successfully.")
+	return nil
+}
+
+// ListenLongPoll starts listening for Telegram updates using long polling.
+func (a *App) ListenLongPoll() {
+	for {
+		select {
+		case <-a.ShutdownChan:
+			log.Println("Shutting down long poll listener.")
+			return
+		default:
+			updates, err := a.TelegramHandler.FetchUpdates()
+			if err != nil {
+				log.Printf("Failed to fetch updates: %v", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			for _, update := range updates {
+				a.HandleUpdate(&update)
+			}
+		}
+	}
 }
 
 // GetSummary generates a brief summary using the OpenAI API.
@@ -936,3 +1220,69 @@ func (a *App) AnalyzeUserCode(userID int) (string, error) {
 
 	return summary, nil
 }
+
+// logToS3 logs user interactions to S3 for auditing purposes.
+func (a *App) logToS3(userID int, username, question, responseTime string, isNoLimitUser bool) {
+	a.logMutex.Lock()
+	defer a.logMutex.Unlock()
+
+	logEntry := map[string]interface{}{
+		"user_id":       userID,
+		"username":      username,
+		"question":      question,
+		"response_time": responseTime,
+		"no_limit_user": isNoLimitUser,
+		"timestamp":     time.Now().Format(time.RFC3339),
+	}
+
+	logBytes, err := json.Marshal(logEntry)
+	if err != nil {
+		log.Printf("Failed to marshal log entry: %v", err)
+		return
+	}
+
+	logKey := fmt.Sprintf("logs/%d/%s.json", userID, uuid.New().String())
+	_, err = a.S3Client.PutObject(&s3.PutObjectInput{
+		Bucket: aws.String(a.S3BucketName),
+		Key:    aws.String(logKey),
+		Body:   bytes.NewReader(logBytes),
+	})
+	if err != nil {
+		log.Printf("Failed to upload log entry to S3: %v", err)
+	}
+}
+
+// GetUserSourceCode retrieves the user's source code.
+
+// initializeS3Client initializes the AWS S3 client.
+// Implemented as needed.
+func initializeS3Client() *s3.S3 {
+	// Initialization logic here
+	return &s3.S3{}
+}
+
+// NewAPIHandler initializes and returns a new APIHandler.
+func NewAPIHandler() *APIHandler {
+	// Initialization logic here
+	return &APIHandler{}
+}
+
+// APIHandler handles interactions with external APIs like OpenAI.
+type APIHandler struct {
+	// Fields as needed
+}
+
+// QueryOpenAIWithMessages queries the OpenAI API with the given messages.
+func (api *APIHandler) QueryOpenAIWithMessages(messages []types.OpenAIMessage) (string, error) {
+	// Implementation logic here
+	return "", nil
+}
+
+// TelegramHandler interface for processing Telegram messages.
+// Assuming it's defined elsewhere.
+type TelegramHandler struct {
+	Processor *handlers.MessageProcessor
+	// Other fields as needed
+}
+
+// No update needed for other methods and functionalities.

@@ -3,6 +3,9 @@
 package s3client
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -15,6 +18,7 @@ type S3ClientInterface interface {
 	ListObjectsV2Pages(input *s3.ListObjectsV2Input, fn func(*s3.ListObjectsV2Output, bool) bool) error
 	DeleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error)
 	HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error)
+	GeneratePresignedURL(bucket, key string, expiration time.Duration) (string, error) // Added method
 }
 
 // S3Client is an implementation of S3ClientInterface for AWS S3
@@ -56,4 +60,22 @@ func (c *S3Client) DeleteObject(input *s3.DeleteObjectInput) (*s3.DeleteObjectOu
 // HeadObject retrieves metadata about an object in the S3 bucket
 func (c *S3Client) HeadObject(input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
 	return c.s3Svc.HeadObject(input)
+}
+
+// GeneratePresignedURL generates a pre-signed URL for the specified S3 object key.
+// The URL expires after the specified duration.
+func (c *S3Client) GeneratePresignedURL(bucket, key string, expiration time.Duration) (string, error) {
+	// Create a GetObject request
+	req, _ := c.s3Svc.GetObjectRequest(&s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+
+	// Presign the request
+	presignedURL, err := req.Presign(expiration)
+	if err != nil {
+		return "", fmt.Errorf("failed to presign S3 URL: %v", err)
+	}
+
+	return presignedURL, nil
 }

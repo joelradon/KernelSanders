@@ -9,6 +9,7 @@ import (
 // MessageProcessor defines the methods that the telegram package requires from the app package.
 type MessageProcessor interface {
 	ProcessMessage(chatID int64, userID int, username string, userQuestion string, messageID int) error
+	ProcessRepositoryShare(chatID int64, userID int, username, repoURL string, messageID int) error
 	HandleCommand(message *types.TelegramMessage, userID int, username string) (string, error)
 	SendMessage(chatID int64, text string, replyToMessageID int) error
 	GetBotUsername() string
@@ -19,5 +20,5 @@ type MessageProcessor interface {
 	HandleUpdate(update *types.TelegramUpdate)          // Added to handle incoming updates
 	GetUserSourceCode(userID int) (string, bool)        // Added to retrieve user source code
 	GetSummary(prompt string) (string, error)           // Added to generate summary of user source code
-	AnalyzeUserCode(userID int) (string, error)         // **Added AnalyzeUserCode method**
+	AnalyzeUserCode(userID int) (string, error)         // Added to generate summary of user source code
 }
