@@ -1,21 +1,17 @@
+// utility_scripts/diagnostic.go
+
 package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
-<<<<<<< Updated upstream
-=======
-	"os/signal"
-	"strings"
-	"syscall"
 	"time"
->>>>>>> Stashed changes
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -78,15 +74,6 @@ func CheckS3Connectivity(config *DiagnosticConfig) error {
 		MaxKeys: aws.Int64(1), // Minimal request
 	})
 
-<<<<<<< Updated upstream
-	port := ":" + os.Getenv("PORT")
-	if port == ":" {
-		port = ":8080"
-	}
-	log.Printf("Starting server on port %s...", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
-=======
 	if err != nil {
 		return fmt.Errorf("failed to connect to S3 bucket '%s': %v", config.S3BucketName, err)
 	}
@@ -97,7 +84,7 @@ func CheckS3Connectivity(config *DiagnosticConfig) error {
 // CheckOpenAIConnectivity verifies that the OpenAI API is reachable with the provided API key
 func CheckOpenAIConnectivity(config *DiagnosticConfig) error {
 	testQuery := map[string]interface{}{
-		"model":    "gpt-4o-mini", // Keeping as per your confirmation
+		"model":    "gpt-4", // Corrected model name
 		"messages": []map[string]string{{"role": "system", "content": "You are a test."}},
 	}
 
@@ -168,56 +155,9 @@ func CheckPortAvailability(port string) error {
 }
 
 func main() {
-	log.Println("Initializing KernelSandersBot application...")
-
-	// Define HTTP handlers
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	// Main application handler
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// TODO: Implement your main handler logic here
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("KernelSandersBot is running."))
-	})
-
-	// Port configuration
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	} else {
-		if strings.Contains(port, ":") {
-			parts := strings.Split(port, ":")
-			port = parts[len(parts)-1]
-		}
-	}
-
-	bindAddress := "0.0.0.0:" + port
-	log.Printf("Starting server on %s...", bindAddress)
-
-	listener, err := net.Listen("tcp4", bindAddress)
-	if err != nil {
-		log.Fatalf("Failed to bind to address %s: %v", bindAddress, err)
-	}
-	defer listener.Close()
-
-	log.Printf("Server successfully bound to %s", listener.Addr().String())
-
-	// Start the server in a separate goroutine
-	serverErrChan := make(chan error, 1)
-	go func() {
-		if err := http.Serve(listener, nil); err != nil && err != http.ErrServerClosed {
-			serverErrChan <- err
-		}
-	}()
-
-	log.Println("HTTP server is running and ready to accept connections.")
-
-	// Initialize DiagnosticConfig
-	diagnosticConfig := &DiagnosticConfig{
-		Port:             port, // Use the already processed port
+	// Initialize DiagnosticConfig from environment variables
+	config := &DiagnosticConfig{
+		Port:             os.Getenv("PORT"),
 		S3EndpointURL:    os.Getenv("AWS_ENDPOINT_URL_S3"),
 		S3Region:         os.Getenv("AWS_REGION"),
 		S3BucketName:     os.Getenv("BUCKET_NAME"),
@@ -226,91 +166,55 @@ func main() {
 		TelegramBotToken: os.Getenv("TELEGRAM_TOKEN"),
 	}
 
-	// Start periodic diagnostics
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go runDiagnosticsWithContext(ctx, diagnosticConfig)
-
-	// Handle graceful shutdown
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-quit:
-		log.Printf("Received signal: %v. Shutting down server...", sig)
-	case err := <-serverErrChan:
-		log.Fatalf("Server encountered an error: %v", err)
-	}
-
-	// Attempt graceful shutdown
-	// Removed ctxShutdown since it's not used
-	if err := listener.Close(); err != nil {
-		log.Fatalf("Error during server shutdown: %v", err)
-	}
-
-	// Cancel diagnostics
-	cancel()
-
-	log.Println("Server shutdown complete.")
-}
-
-// runDiagnosticsWithContext runs diagnostics periodically until the context is canceled
-func runDiagnosticsWithContext(ctx context.Context, config *DiagnosticConfig) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
+	// Define the interval for diagnostics
+	diagnosticInterval := 5 * time.Minute
 
 	for {
-		select {
-		case <-ticker.C:
-			log.Println("Starting Diagnostic Checks...")
+		log.Println("Starting Diagnostic Checks...")
 
-			// 1. Check Environment Variables
-			log.Println("1. Verifying Environment Variables...")
-			if err := CheckEnvironmentVariables(config); err != nil {
-				log.Printf("Environment Variables Check Failed: %v", err)
-			} else {
-				log.Println("Environment Variables Check Passed.")
-			}
-
-			// 2. Check S3 Connectivity
-			log.Println("2. Checking S3 Connectivity...")
-			if err := CheckS3Connectivity(config); err != nil {
-				log.Printf("S3 Connectivity Check Failed: %v", err)
-			} else {
-				log.Println("S3 Connectivity Check Passed.")
-			}
-
-			// 3. Check OpenAI API Connectivity
-			log.Println("3. Checking OpenAI API Connectivity...")
-			if err := CheckOpenAIConnectivity(config); err != nil {
-				log.Printf("OpenAI API Connectivity Check Failed: %v", err)
-			} else {
-				log.Println("OpenAI API Connectivity Check Passed.")
-			}
-
-			// 4. Check Telegram API Connectivity
-			log.Println("4. Checking Telegram API Connectivity...")
-			if err := CheckTelegramConnectivity(config); err != nil {
-				log.Printf("Telegram API Connectivity Check Failed: %v", err)
-			} else {
-				log.Println("Telegram API Connectivity Check Passed.")
-			}
-
-			// 5. Check Port Availability
-			log.Println("5. Checking Port Availability...")
-			if err := CheckPortAvailability(config.Port); err != nil {
-				log.Printf("Port Availability Check Failed: %v", err)
-			} else {
-				log.Println("Port Availability Check Passed.")
-			}
-
-			log.Println("Diagnostic Checks Completed.")
-
-		case <-ctx.Done():
-			log.Println("Stopping diagnostics.")
-			return
+		// 1. Check Environment Variables
+		log.Println("1. Verifying Environment Variables...")
+		if err := CheckEnvironmentVariables(config); err != nil {
+			log.Printf("Environment Variables Check Failed: %v", err)
+		} else {
+			log.Println("Environment Variables Check Passed.")
 		}
->>>>>>> Stashed changes
+
+		// 2. Check S3 Connectivity
+		log.Println("2. Checking S3 Connectivity...")
+		if err := CheckS3Connectivity(config); err != nil {
+			log.Printf("S3 Connectivity Check Failed: %v", err)
+		} else {
+			log.Println("S3 Connectivity Check Passed.")
+		}
+
+		// 3. Check OpenAI API Connectivity
+		log.Println("3. Checking OpenAI API Connectivity...")
+		if err := CheckOpenAIConnectivity(config); err != nil {
+			log.Printf("OpenAI API Connectivity Check Failed: %v", err)
+		} else {
+			log.Println("OpenAI API Connectivity Check Passed.")
+		}
+
+		// 4. Check Telegram API Connectivity
+		log.Println("4. Checking Telegram API Connectivity...")
+		if err := CheckTelegramConnectivity(config); err != nil {
+			log.Printf("Telegram API Connectivity Check Failed: %v", err)
+		} else {
+			log.Println("Telegram API Connectivity Check Passed.")
+		}
+
+		// 5. Check Port Availability
+		log.Println("5. Checking Port Availability...")
+		if err := CheckPortAvailability(config.Port); err != nil {
+			log.Printf("Port Availability Check Failed: %v", err)
+		} else {
+			log.Println("Port Availability Check Passed.")
+		}
+
+		log.Println("Diagnostic Checks Completed.")
+
+		// Wait for the next diagnostic run
+		time.Sleep(diagnosticInterval)
 	}
 }
